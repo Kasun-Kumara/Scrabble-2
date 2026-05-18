@@ -1,0 +1,37 @@
+{
+  "board_size": 15,
+  "label_orientation": "A1-top-left",
+  "image_path": "D:/New folder (4)/hasbro-board.png",
+  "image_corners": [
+    [
+      36.0,
+      41.0
+    ],
+    [
+      517.0,
+      33.0
+    ],
+    [
+      512.0,
+      525.0
+    ],
+    [
+      38.0,
+      525.0
+    ]
+  ],
+  "machine": {
+    "reference_square": "A1",
+    "reference_x": 0.0,
+    "reference_y": 0.0,
+    "unit_col_x": 10.0,
+    "unit_col_y": 0.0,
+    "unit_row_x": -0.0,
+    "unit_row_y": 10.0,
+    "square_pitch": 10.0,
+    "rotation_degrees": 0.0,
+    "second_reference_square": "O15",
+    "second_reference_x": 140.0,
+    "second_reference_y": 140.0
+  }
+}
