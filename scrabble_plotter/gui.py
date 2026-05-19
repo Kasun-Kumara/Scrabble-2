@@ -7,7 +7,13 @@ from tkinter import filedialog, messagebox, ttk
 from .board import parse_square_label
 from .calibration import MachineCalibration, PlotterCalibration
 from .image_calibration import collect_board_corners
-from .serial_sender import GCodeSender, SerialConfig, format_move_command, list_serial_ports
+from .serial_sender import (
+    GCodeSender,
+    SerialConfig,
+    format_move_command,
+    format_reset_command,
+    list_serial_ports,
+)
 
 
 class ScrabblePlotterApp:
@@ -15,6 +21,7 @@ class ScrabblePlotterApp:
         self.root = root
         self.root.title("Scrabble Plotter Sender")
         self.root.geometry("1100x760")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.calibration_path = tk.StringVar(value=str(Path("scrabble_plotter_calibration.json").resolve()))
         self.image_path = tk.StringVar()
@@ -35,6 +42,8 @@ class ScrabblePlotterApp:
 
         self.status_var = tk.StringVar(value="Choose an image, calibrate, then enter a square and COM port.")
         self.preview_image = None
+        self._sender: GCodeSender | None = None
+        self._sender_key: tuple[str, int, float, bool] | None = None
         self._build_ui()
         self.refresh_ports()
         self.load_calibration_into_form()
@@ -121,6 +130,9 @@ class ScrabblePlotterApp:
         )
         ttk.Button(move_box, text="Send Move", command=self.send_move).grid(
             row=8, column=0, columnspan=3, sticky="ew"
+        )
+        ttk.Button(move_box, text="Reset To Start", command=self.reset_to_start).grid(
+            row=9, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
 
         log_box = ttk.LabelFrame(controls, text="Status", padding=10)
@@ -228,23 +240,26 @@ class ScrabblePlotterApp:
             calibration.validate_ready_for_move()
             square = parse_square_label(self.square_var.get())
             x, y = calibration.square_center_in_machine(square)
-            config = SerialConfig(
-                port=self.port_var.get().strip(),
-                baud=int(self.baud_var.get()),
-                timeout=float(self.timeout_var.get()),
-                startup_g90=self.startup_g90_var.get(),
-            )
-            if not config.port:
-                raise ValueError("Enter a COM port such as COM3.")
-            sender = GCodeSender(config)
+            sender = self._get_sender()
             gcode, responses = sender.send_move(
                 x,
                 y,
                 feed_rate=self._optional_float(self.feed_rate_var.get()),
                 command=self.command_var.get().strip() or "G0",
             )
-            self._set_status(f"Sent {square.label} to {config.port}")
+            self._set_status(f"Sent {square.label} to {sender.config.port}")
             self._log(f"Sent: {gcode}")
+            if responses:
+                self._log("Responses: " + " | ".join(responses))
+        except Exception as exc:
+            self._show_error(exc)
+
+    def reset_to_start(self) -> None:
+        try:
+            sender = self._get_sender()
+            command, responses = sender.send_reset()
+            self._set_status(f"Sent reset command to {sender.config.port}")
+            self._log(f"Sent: {command}")
             if responses:
                 self._log("Responses: " + " | ".join(responses))
         except Exception as exc:
@@ -278,6 +293,37 @@ class ScrabblePlotterApp:
     def _optional_float(self, raw: str) -> float | None:
         value = raw.strip()
         return float(value) if value else None
+
+    def _serial_config(self) -> SerialConfig:
+        config = SerialConfig(
+            port=self.port_var.get().strip(),
+            baud=int(self.baud_var.get()),
+            timeout=float(self.timeout_var.get()),
+            startup_g90=self.startup_g90_var.get(),
+        )
+        if not config.port:
+            raise ValueError("Enter a COM port such as COM3.")
+        return config
+
+    def _get_sender(self) -> GCodeSender:
+        config = self._serial_config()
+        sender_key = (config.port, config.baud, config.timeout, config.startup_g90)
+        if self._sender is not None and self._sender_key == sender_key:
+            return self._sender
+
+        if self._sender is not None:
+            self._sender.close()
+
+        self._sender = GCodeSender(config)
+        self._sender.open()
+        self._sender_key = sender_key
+        self._log(f"Connected to {config.port} at {config.baud} baud.")
+        return self._sender
+
+    def _on_close(self) -> None:
+        if self._sender is not None:
+            self._sender.close()
+        self.root.destroy()
 
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)

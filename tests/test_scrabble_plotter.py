@@ -6,7 +6,7 @@ import unittest
 from scrabble_plotter.board import parse_square_label
 from scrabble_plotter.calibration import MachineCalibration, PlotterCalibration
 from scrabble_plotter.main import build_parser
-from scrabble_plotter.serial_sender import format_move_command
+from scrabble_plotter.serial_sender import format_move_command, format_reset_command
 
 
 class SquareParserTests(unittest.TestCase):
@@ -64,6 +64,9 @@ class MachineCalibrationTests(unittest.TestCase):
 class GCodeFormattingTests(unittest.TestCase):
     def test_gcode_formatting(self) -> None:
         self.assertEqual(format_move_command(10.0, 20.5, 1500.0), "G0 X10 Y20.5 F1500")
+
+    def test_reset_command_formatting(self) -> None:
+        self.assertEqual(format_reset_command(), "HOMEZERO")
 
 
 class CliTests(unittest.TestCase):

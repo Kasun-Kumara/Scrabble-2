@@ -35,6 +35,10 @@ def format_move_command(x: float, y: float, feed_rate: float | None = None, comm
     return " ".join(parts)
 
 
+def format_reset_command() -> str:
+    return "HOMEZERO"
+
+
 @dataclass
 class SerialConfig:
     port: str
@@ -46,6 +50,7 @@ class SerialConfig:
 class GCodeSender:
     def __init__(self, config: SerialConfig):
         self.config = config
+        self._connection = None
 
     def send_move(
         self,
@@ -58,10 +63,48 @@ class GCodeSender:
         responses = self.send_commands([gcode])
         return gcode, responses
 
-    def send_commands(self, commands: list[str]) -> list[str]:
+    def send_reset(self) -> tuple[str, list[str]]:
+        command = format_reset_command()
+        responses = self.send_commands([command])
+        return command, responses
+
+    def open(self) -> None:
+        if self._connection is not None:
+            return
+
         serial = _require_serial()
-        with serial.Serial(self.config.port, self.config.baud, timeout=self.config.timeout) as connection:
-            time.sleep(2)
+        connection = serial.Serial(self.config.port, self.config.baud, timeout=self.config.timeout)
+        try:
+            connection.setDTR(False)
+            connection.setRTS(False)
+        except Exception:
+            pass
+        time.sleep(2)
+        try:
+            connection.reset_input_buffer()
+            connection.reset_output_buffer()
+        except Exception:
+            pass
+        self._connection = connection
+
+    def close(self) -> None:
+        if self._connection is None:
+            return
+        try:
+            self._connection.close()
+        finally:
+            self._connection = None
+
+    def send_commands(self, commands: list[str]) -> list[str]:
+        should_close = self._connection is None
+        if should_close:
+            self.open()
+
+        connection = self._connection
+        if connection is None:
+            raise RuntimeError("Serial connection could not be opened.")
+
+        try:
             if self.config.startup_g90:
                 self._write_line(connection, "G90")
                 self._read_responses(connection)
@@ -71,6 +114,9 @@ class GCodeSender:
                 self._write_line(connection, command)
                 responses.extend(self._read_responses(connection))
             return responses
+        finally:
+            if should_close:
+                self.close()
 
     def _write_line(self, connection, line: str) -> None:  # type: ignore[no-untyped-def]
         connection.write((line.strip() + "\n").encode("utf-8"))
