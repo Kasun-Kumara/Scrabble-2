@@ -18,7 +18,11 @@ def collect_board_corners(image_path: str) -> list[tuple[float, float]]:
     image = cv2.imread(str(Path(image_path)))
     if image is None:
         raise ValueError(f"Unable to load image at '{image_path}'.")
+    return collect_board_corners_from_frame(image)
 
+
+def collect_board_corners_from_frame(image) -> list[tuple[float, float]]:  # type: ignore[no-untyped-def]
+    cv2 = _require_cv2()
     corners: list[tuple[float, float]] = []
     display = image.copy()
     window_name = "Scrabble Board Calibration"

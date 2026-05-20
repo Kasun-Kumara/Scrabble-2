@@ -39,6 +39,10 @@ def format_reset_command() -> str:
     return "HOMEZERO"
 
 
+def format_steps_command(x_steps_per_mm: float, y_steps_per_mm: float) -> str:
+    return f"STEPS X{_format_float(x_steps_per_mm)} Y{_format_float(y_steps_per_mm)}"
+
+
 @dataclass
 class SerialConfig:
     port: str
@@ -65,6 +69,11 @@ class GCodeSender:
 
     def send_reset(self) -> tuple[str, list[str]]:
         command = format_reset_command()
+        responses = self.send_commands([command])
+        return command, responses
+
+    def send_step_config(self, x_steps_per_mm: float, y_steps_per_mm: float) -> tuple[str, list[str]]:
+        command = format_steps_command(x_steps_per_mm, y_steps_per_mm)
         responses = self.send_commands([command])
         return command, responses
 

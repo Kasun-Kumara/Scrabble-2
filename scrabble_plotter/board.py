@@ -3,8 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-BOARD_SIZE = 15
-SQUARE_LABEL_PATTERN = re.compile(r"^([A-Oa-o])(1[0-5]|[1-9])$")
+BOARD_SIZE = 12
+CELL_SIZE_MM = 30.0
+SQUARE_LABEL_PATTERN = re.compile(r"^([A-La-l])(1[0-2]|[1-9])$")
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,7 @@ def parse_square_label(label: str) -> Square:
     match = SQUARE_LABEL_PATTERN.match(normalized)
     if not match:
         raise ValueError(
-            f"Invalid square label '{label}'. Use Letter+number from A1 to O15."
+            f"Invalid square label '{label}'. Use Letter+number from A1 to L12."
         )
 
     col = ord(match.group(1)) - ord("A")
