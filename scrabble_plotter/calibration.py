@@ -9,6 +9,22 @@ from typing import Any
 from .board import BOARD_SIZE, CELL_SIZE_MM, Square
 
 
+PREMIUM_NORMAL = "normal"
+PREMIUM_DOUBLE_LETTER = "double_letter"
+PREMIUM_TRIPLE_LETTER = "triple_letter"
+PREMIUM_DOUBLE_WORD = "double_word"
+PREMIUM_TRIPLE_WORD = "triple_word"
+VALID_PREMIUM_CODES = {
+    PREMIUM_NORMAL,
+    PREMIUM_DOUBLE_LETTER,
+    PREMIUM_TRIPLE_LETTER,
+    PREMIUM_DOUBLE_WORD,
+    PREMIUM_TRIPLE_WORD,
+}
+DEFAULT_OCR_CONFIDENCE_THRESHOLD = 50.0
+DEFAULT_OCR_CELL_SIZE_PX = 80
+
+
 def _require_cv2():
     try:
         import cv2  # type: ignore
@@ -33,6 +49,9 @@ class PlotterCalibration:
     y_steps_per_mm: float = 80.0
     cart_x_mm: float = 0.0
     cart_y_mm: float = 0.0
+    premium_layout: list[list[str]] = field(default_factory=lambda: default_premium_layout())
+    ocr_confidence_threshold: float = DEFAULT_OCR_CONFIDENCE_THRESHOLD
+    ocr_cell_size_px: int = DEFAULT_OCR_CELL_SIZE_PX
 
     def set_image_corners(
         self,
@@ -59,6 +78,16 @@ class PlotterCalibration:
             raise ValueError("Cell size must be greater than 0.")
         if self.x_steps_per_mm <= 0 or self.y_steps_per_mm <= 0:
             raise ValueError("Stepper scale must be greater than 0.")
+
+    def validate_ready_for_scan(self) -> None:
+        if self.board_size != BOARD_SIZE:
+            raise ValueError(f"Calibration board size must be {BOARD_SIZE}.")
+        if len(self.image_corners) != 4:
+            raise ValueError("Camera board calibration is missing.")
+        if self.ocr_cell_size_px <= 0:
+            raise ValueError("OCR cell size must be greater than 0.")
+        if self.ocr_confidence_threshold < 0 or self.ocr_confidence_threshold > 100:
+            raise ValueError("OCR confidence threshold must be from 0 to 100.")
 
     def square_center_in_image(self, square: Square) -> tuple[float, float]:
         if len(self.image_corners) != 4:
@@ -95,6 +124,9 @@ class PlotterCalibration:
             "y_steps_per_mm": self.y_steps_per_mm,
             "cart_x_mm": self.cart_x_mm,
             "cart_y_mm": self.cart_y_mm,
+            "premium_layout": normalize_premium_layout(self.premium_layout, self.board_size),
+            "ocr_confidence_threshold": self.ocr_confidence_threshold,
+            "ocr_cell_size_px": self.ocr_cell_size_px,
         }
 
     @classmethod
@@ -112,6 +144,14 @@ class PlotterCalibration:
             y_steps_per_mm=float(payload.get("y_steps_per_mm", 80.0)),
             cart_x_mm=float(payload.get("cart_x_mm", 0.0)),
             cart_y_mm=float(payload.get("cart_y_mm", 0.0)),
+            premium_layout=normalize_premium_layout(
+                payload.get("premium_layout", default_premium_layout()),
+                int(payload.get("board_size", BOARD_SIZE)),
+            ),
+            ocr_confidence_threshold=float(
+                payload.get("ocr_confidence_threshold", DEFAULT_OCR_CONFIDENCE_THRESHOLD)
+            ),
+            ocr_cell_size_px=int(payload.get("ocr_cell_size_px", DEFAULT_OCR_CELL_SIZE_PX)),
         )
 
     @classmethod
@@ -133,6 +173,28 @@ class PlotterCalibration:
 def board_corner_points(board_size: int = BOARD_SIZE) -> list[list[float]]:
     size = float(board_size)
     return [[0.0, 0.0], [size, 0.0], [size, size], [0.0, size]]
+
+
+def default_premium_layout(board_size: int = BOARD_SIZE) -> list[list[str]]:
+    return [[PREMIUM_NORMAL for _ in range(board_size)] for _ in range(board_size)]
+
+
+def normalize_premium_layout(payload: Any, board_size: int = BOARD_SIZE) -> list[list[str]]:
+    if board_size != BOARD_SIZE:
+        board_size = BOARD_SIZE
+
+    if not isinstance(payload, list):
+        return default_premium_layout(board_size)
+
+    layout = default_premium_layout(board_size)
+    for row_index in range(min(board_size, len(payload))):
+        row = payload[row_index]
+        if not isinstance(row, list):
+            continue
+        for col_index in range(min(board_size, len(row))):
+            code = str(row[col_index])
+            layout[row_index][col_index] = code if code in VALID_PREMIUM_CODES else PREMIUM_NORMAL
+    return layout
 
 
 def _to_float32(values: list[list[float]] | list[list[list[float]]]):

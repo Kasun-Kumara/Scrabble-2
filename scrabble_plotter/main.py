@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from .board import parse_square_label
 from .calibration import PlotterCalibration
 from .gui import launch_gui
 from .image_calibration import collect_board_corners
+from .scanner import scan_image_file
+from .scoring import score_board
 from .serial_sender import GCodeSender, SerialConfig
 
 
@@ -23,6 +26,10 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to the JSON calibration file to create or update.",
     )
+
+    scan_parser = subparsers.add_parser("scan-image", help="Scan and score a saved board image.")
+    scan_parser.add_argument("--image", required=True, help="Path to the board image.")
+    scan_parser.add_argument("--calibration", required=True, help="Path to the JSON calibration file.")
 
     offset_parser = subparsers.add_parser("set-offset", help="Save the board top-left plotter offset.")
     offset_parser.add_argument("--calibration", required=True, help="Path to the JSON calibration file.")
@@ -63,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "calibrate-image":
         return run_calibrate_image(args.image, args.calibration)
+    if args.command == "scan-image":
+        return run_scan_image(args.image, args.calibration)
     if args.command == "set-offset":
         return run_set_offset(args)
     if args.command == "move":
@@ -82,6 +91,18 @@ def run_calibrate_image(image_path: str, calibration_path: str) -> int:
     calibration.set_image_corners(image_path, corners, calibration_path)
     calibration.save(calibration_path)
     print(f"Saved image calibration to {Path(calibration_path).resolve()}")
+    return 0
+
+
+def run_scan_image(image_path: str, calibration_path: str) -> int:
+    calibration = PlotterCalibration.load(calibration_path)
+    scan = scan_image_file(image_path, calibration)
+    score = score_board(
+        scan.board_letters(),
+        premium_layout=calibration.premium_layout,
+        blank_squares=scan.blank_squares(),
+    )
+    print(json.dumps({"scan": scan.to_dict(), "score": score.to_dict()}, indent=2))
     return 0
 
 
