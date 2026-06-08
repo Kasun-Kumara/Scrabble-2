@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -14,16 +13,7 @@ from .gemini_agent import (
     PlotterAgentAction,
 )
 from .image_calibration import collect_board_corners_from_frame
-from .overlay import draw_camera_ocr_overlay
-from .scanner import (
-    BoardScanResult,
-    CameraLetterScanResult,
-    CameraWordScanResult,
-    format_camera_words_numbered,
-    scan_board_image,
-    scan_camera_letters,
-    scan_camera_words,
-)
+from .scanner import BoardScanResult, scan_board_image
 from .scoring import (
     ScoreResult,
     normalize_letter,
@@ -37,10 +27,6 @@ from .serial_sender import (
     format_move_command,
     list_serial_ports,
 )
-
-
-LIVE_LETTER_SCAN_INTERVAL_SECONDS = 4.0
-LIVE_WORD_SCAN_INTERVAL_SECONDS = 4.0
 
 
 class ScrabblePlotterApp:
@@ -74,11 +60,8 @@ class ScrabblePlotterApp:
         self.gemini_model_var = tk.StringVar(value="gemini-2.5-flash")
         self.gemini_objective_var = tk.StringVar(value="Choose the next board square.")
         self.gemini_include_camera_var = tk.BooleanVar(value=True)
-        self.live_letter_scan_var = tk.BooleanVar(value=False)
-        self.live_word_scan_var = tk.BooleanVar(value=True)
         self._last_agent_action: PlotterAgentAction | None = None
         self.blank_squares_var = tk.StringVar()
-        self.captured_letters_var = tk.StringVar()
         self._letter_vars: list[list[tk.StringVar]] = [
             [tk.StringVar() for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)
         ]
@@ -90,24 +73,14 @@ class ScrabblePlotterApp:
             ]
             for row in range(BOARD_SIZE)
         ]
-        self._last_scan: BoardScanResult | None = None
-        self._last_camera_letter_scan: CameraLetterScanResult | None = None
-        self._last_camera_word_scan: CameraWordScanResult | None = None
-        self._camera_word_scan_running = False
-        self.camera_words_text: tk.Text | None = None
 
         self.status_var = tk.StringVar(
-            value="Start the camera to find visible words."
+            value="Ready. Enter board letters or start the camera for preview."
         )
         self.preview_image = None
         self._camera = None
         self._camera_after_id: str | None = None
         self._latest_frame = None
-        self._last_live_letter_scan_at = 0.0
-        self._live_letter_scan_running = False
-        self._last_live_letter_scan_error: str | None = None
-        self._last_live_word_scan_at = 0.0
-        self._last_live_word_scan_error: str | None = None
         self._sender: GCodeSender | None = None
         self._sender_key: tuple[str, int, float, bool] | None = None
 
@@ -128,7 +101,7 @@ class ScrabblePlotterApp:
         preview_frame = ttk.LabelFrame(frame, text="Live Camera", padding=10)
         preview_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         preview_frame.columnconfigure(4, weight=1)
-        preview_frame.rowconfigure(2, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
 
         ttk.Label(preview_frame, text="Camera").grid(row=0, column=0, sticky="w")
         camera_selector = ttk.Combobox(
@@ -144,21 +117,8 @@ class ScrabblePlotterApp:
             row=0, column=4, sticky="w"
         )
 
-        live_options = ttk.Frame(preview_frame)
-        live_options.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(
-            live_options,
-            text="Live letters",
-            variable=self.live_letter_scan_var,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(
-            live_options,
-            text="Live words",
-            variable=self.live_word_scan_var,
-        ).grid(row=0, column=1, sticky="w", padx=(14, 0))
-
         self.preview_label = ttk.Label(preview_frame, text="Camera stopped", anchor="center")
-        self.preview_label.grid(row=2, column=0, columnspan=5, sticky="nsew", pady=(8, 0))
+        self.preview_label.grid(row=1, column=0, columnspan=5, sticky="nsew", pady=(8, 0))
 
         controls_container = ttk.Frame(frame)
         controls_container.grid(row=0, column=1, sticky="nsew")
@@ -257,7 +217,7 @@ class ScrabblePlotterApp:
             row=10, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
 
-        scan_box = ttk.LabelFrame(controls, text="Camera OCR", padding=10)
+        scan_box = ttk.LabelFrame(controls, text="Board Score", padding=10)
         scan_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         scan_box.columnconfigure(0, weight=1)
 
@@ -265,26 +225,15 @@ class ScrabblePlotterApp:
         scan_buttons.grid(row=0, column=0, sticky="ew")
         scan_buttons.columnconfigure(0, weight=1)
         scan_buttons.columnconfigure(1, weight=1)
-        scan_buttons.columnconfigure(2, weight=1)
-        ttk.Button(scan_buttons, text="Capture Letters", command=self.capture_letters_from_camera).grid(
+        ttk.Button(scan_buttons, text="Scan Board", command=self.scan_board_from_camera).grid(
             row=0, column=0, sticky="ew", padx=(0, 6)
         )
-        ttk.Button(scan_buttons, text="Find Words", command=self.identify_words_with_paddleocr).grid(
-            row=0, column=1, sticky="ew", padx=(0, 6)
-        )
         ttk.Button(scan_buttons, text="Calculate Score", command=self.calculate_score_from_board).grid(
-            row=0, column=2, sticky="ew"
+            row=0, column=1, sticky="ew"
         )
-
-        ttk.Label(scan_box, text="Captured Letters").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(scan_box, textvariable=self.captured_letters_var).grid(row=2, column=0, sticky="ew")
-
-        ttk.Label(scan_box, text="Detected Words").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        self.camera_words_text = tk.Text(scan_box, height=5, wrap="word", state="disabled")
-        self.camera_words_text.grid(row=4, column=0, sticky="ew")
 
         board_grid = ttk.Frame(scan_box)
-        board_grid.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        board_grid.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         for col in range(BOARD_SIZE):
             ttk.Label(board_grid, text=chr(ord("A") + col), width=3, anchor="center").grid(row=0, column=col + 1)
         self._letter_entries = []
@@ -306,11 +255,11 @@ class ScrabblePlotterApp:
                 entry_row.append(entry)
             self._letter_entries.append(entry_row)
 
-        ttk.Label(scan_box, text="Blank Squares").grid(row=6, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(scan_box, textvariable=self.blank_squares_var).grid(row=7, column=0, sticky="ew")
+        ttk.Label(scan_box, text="Blank Squares").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(scan_box, textvariable=self.blank_squares_var).grid(row=3, column=0, sticky="ew")
 
         premium_box = ttk.LabelFrame(scan_box, text="Premium Layout (DL TL DW TW)", padding=6)
-        premium_box.grid(row=8, column=0, sticky="ew", pady=(10, 0))
+        premium_box.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         for col in range(BOARD_SIZE):
             ttk.Label(premium_box, text=chr(ord("A") + col), width=3, anchor="center").grid(row=0, column=col + 1)
         for row in range(BOARD_SIZE):
@@ -326,8 +275,8 @@ class ScrabblePlotterApp:
                 )
                 entry.grid(row=row + 1, column=col + 1, padx=1, pady=1)
                 entry.bind("<FocusOut>", lambda event: self._normalize_premium_entries())
-        ttk.Button(scan_box, text="Save Scan Settings", command=self.save_board_settings).grid(
-            row=9, column=0, sticky="ew", pady=(10, 0)
+        ttk.Button(scan_box, text="Save Board Settings", command=self.save_board_settings).grid(
+            row=5, column=0, sticky="ew", pady=(10, 0)
         )
 
         agent_box = ttk.LabelFrame(controls, text="Gemini Agent", padding=10)
@@ -392,9 +341,9 @@ class ScrabblePlotterApp:
         self.ocr_cell_size_px_var.set(str(self._calibration.ocr_cell_size_px))
         self._load_premium_layout_into_form()
         if len(self._calibration.image_corners) == 4:
-            self._set_status("Loaded board calibration. Start the camera to find visible words.")
+            self._set_status("Loaded board calibration.")
         else:
-            self._set_status("Start the camera to find visible words.")
+            self._set_status("Ready. Enter board letters or start the camera for preview.")
 
     def save_board_settings(self) -> None:
         try:
@@ -444,16 +393,6 @@ class ScrabblePlotterApp:
             self._calibration = self._calibration_from_form()
             self._calibration.camera_index = camera_index
             self._calibration.save(self.calibration_path.get())
-            self._last_live_letter_scan_at = 0.0
-            self._live_letter_scan_running = False
-            self._last_live_letter_scan_error = None
-            self._last_camera_letter_scan = None
-            self._last_live_word_scan_at = 0.0
-            self._last_live_word_scan_error = None
-            self._last_camera_word_scan = None
-            self._camera_word_scan_running = False
-            self.captured_letters_var.set("")
-            self._set_camera_words_text("")
             self._set_status(f"Camera {camera_index} started.")
             self._schedule_camera_update()
         except Exception as exc:
@@ -480,7 +419,7 @@ class ScrabblePlotterApp:
             self._calibration = self._calibration_from_form()
             self._calibration.set_camera_corners(corners)
             self._calibration.save(self.calibration_path.get())
-            self._set_status("Saved board corners for board scanning.")
+            self._set_status("Saved board corners for calibration.")
             self._log(f"Board corners: {corners}")
             self._show_frame(self._latest_frame)
         except Exception as exc:
@@ -517,52 +456,23 @@ class ScrabblePlotterApp:
             self._show_error(exc)
 
     def scan_board_from_camera(self) -> None:
-        self.capture_letters_from_camera()
-
-    def capture_letters_from_camera(self) -> None:
         if self._latest_frame is None:
             raise_user_error("Start the camera first.")
             return
 
         try:
-            confidence_threshold = self._ocr_confidence_threshold()
-            self._set_status("Capturing letters from the camera...")
-            self._log("Camera letter capture started.")
+            calibration = self._calibration_from_form()
+            calibration.validate_ready_for_scan()
+            self._set_status("Scanning board letters into the matrix...")
+            self._log("Board scan started.")
             thread = threading.Thread(
-                target=self._camera_letter_scan_worker,
-                args=(self._latest_frame.copy(), confidence_threshold, True),
+                target=self._scan_board_worker,
+                args=(self._latest_frame.copy(), calibration),
                 daemon=True,
             )
             thread.start()
         except Exception as exc:
             self._show_error(exc)
-
-    def identify_words_with_paddleocr(self) -> None:
-        if self._latest_frame is None:
-            raise_user_error("Start the camera first.")
-            return
-        if self._camera_word_scan_running:
-            self._set_status("PaddleOCR word detection is already running.")
-            return
-
-        try:
-            confidence_threshold = self._ocr_confidence_threshold()
-            self._camera_word_scan_running = True
-            self._set_status("Finding camera words with PaddleOCR...")
-            self._set_camera_words_text("Finding words...")
-            self._log("PaddleOCR word detection started.")
-            thread = threading.Thread(
-                target=self._camera_word_scan_worker,
-                args=(self._latest_frame.copy(), confidence_threshold, True),
-                daemon=True,
-            )
-            thread.start()
-        except Exception as exc:
-            self._camera_word_scan_running = False
-            self._show_error(exc)
-
-    def identify_words_with_gemini(self) -> None:
-        self.identify_words_with_paddleocr()
 
     def calculate_score_from_board(self) -> None:
         try:
@@ -611,103 +521,24 @@ class ScrabblePlotterApp:
                 premium_layout=calibration.premium_layout,
                 blank_squares=scan.blank_squares(),
             )
-            self.root.after(0, lambda: self._handle_scan_result(scan, score, announce=True))
+            self.root.after(0, lambda: self._handle_scan_result(scan, score))
         except Exception as exc:
             self.root.after(0, lambda exc=exc: self._show_error(exc))
 
-    def _camera_letter_scan_worker(
-        self,
-        frame,
-        confidence_threshold: float,
-        announce: bool,
-    ) -> None:  # type: ignore[no-untyped-def]
-        try:
-            scan = scan_camera_letters(frame, confidence_threshold=confidence_threshold)
-            self.root.after(0, lambda: self._handle_camera_letter_scan_result(scan, announce=announce))
-        except Exception as exc:
-            self.root.after(0, lambda exc=exc: self._handle_camera_letter_scan_error(exc, announce=announce))
-
-    def _camera_word_scan_worker(
-        self,
-        frame,
-        confidence_threshold: float,
-        announce: bool,
-    ) -> None:  # type: ignore[no-untyped-def]
-        try:
-            scan = scan_camera_words(frame, confidence_threshold=confidence_threshold)
-            self.root.after(0, lambda: self._handle_camera_word_scan_result(scan, announce=announce))
-        except Exception as exc:
-            self.root.after(0, lambda exc=exc: self._handle_camera_word_scan_error(exc, announce=announce))
-
-    def _handle_camera_letter_scan_result(
-        self,
-        scan: CameraLetterScanResult,
-        announce: bool = False,
-    ) -> None:
-        self._live_letter_scan_running = False
-        self._last_live_letter_scan_error = None
-        self._last_camera_letter_scan = scan
-        captured_text = scan.text()
-        self.captured_letters_var.set(captured_text)
-        if captured_text:
-            message = f"Captured {len(scan.letters)} letter group(s): {captured_text}"
-        else:
-            message = "No letters captured from the camera."
-        self._set_status(message)
-        if announce:
-            self._log(message)
-
-    def _handle_camera_letter_scan_error(self, exc: Exception, announce: bool = False) -> None:
-        self._live_letter_scan_running = False
-        message = str(exc)
-        if announce or self._last_live_letter_scan_error != message:
-            self._last_live_letter_scan_error = message
-            self._set_status(f"Letter capture paused: {message}")
-            self._log(f"Letter capture paused: {message}")
-        if "tesseract" in message.lower():
-            self.live_letter_scan_var.set(False)
-
-    def _handle_camera_word_scan_result(
-        self,
-        scan: CameraWordScanResult,
-        announce: bool = False,
-    ) -> None:
-        self._camera_word_scan_running = False
-        self._last_live_word_scan_error = None
-        self._last_camera_word_scan = scan
-        formatted_words = format_camera_words_numbered(scan.words)
-        self._set_camera_words_text(formatted_words)
-        if scan.words:
-            self._set_status(f"PaddleOCR found {len(scan.words)} matching word(s) from {len(scan.tiles)} tile(s).")
-            if announce:
-                self._log("Detected words:\n" + formatted_words)
-        else:
-            self._set_status(f"PaddleOCR found {len(scan.tiles)} tile(s), but no matching words.")
-            if announce:
-                self._log("Detected words: none")
-
-    def _handle_camera_word_scan_error(self, exc: Exception, announce: bool = False) -> None:
-        self._camera_word_scan_running = False
-        message = str(exc)
-        if announce or self._last_live_word_scan_error != message:
-            self._last_live_word_scan_error = message
-            self._set_status(f"Word detection paused: {message}")
-            self._log(f"Word detection paused: {message}")
-        if "paddle" in message.lower():
-            self.live_word_scan_var.set(False)
-
-    def _handle_scan_result(self, scan: BoardScanResult, score: ScoreResult, announce: bool = True) -> None:
-        self._last_scan = scan
+    def _handle_scan_result(self, scan: BoardScanResult, score: ScoreResult) -> None:
         try:
             threshold = float(self.ocr_confidence_threshold_var.get())
         except ValueError:
             threshold = self._calibration.ocr_confidence_threshold
+
         cells_by_square = {cell.square: cell for cell in scan.cells}
         for row in range(BOARD_SIZE):
             for col in range(BOARD_SIZE):
-                cell = cells_by_square.get(f"{chr(ord('A') + col)}{row + 1}")
+                square = f"{chr(ord('A') + col)}{row + 1}"
+                cell = cells_by_square.get(square)
                 letter = cell.letter if cell else ""
                 self._letter_vars[row][col].set(letter)
+
                 entry = self._letter_entries[row][col]
                 if cell is not None and cell.occupied and (not cell.letter or cell.confidence < threshold):
                     entry.configure(bg="#fff2a8")
@@ -715,17 +546,13 @@ class ScrabblePlotterApp:
                     entry.configure(bg="#e8f7e8")
                 else:
                     entry.configure(bg="white")
-        self.blank_squares_var.set("")
+
+        self.blank_squares_var.set(" ".join(sorted(scan.blank_squares())))
         occupied = sum(1 for cell in scan.cells if cell.occupied)
         recognized = sum(1 for cell in scan.cells if cell.letter)
-        if announce:
-            self._handle_score_result(score)
-            self._set_status(f"Scanned {recognized} letters from {occupied} occupied cells.")
-            self._log(f"Scan complete: {recognized} recognized, {occupied} occupied.")
-        else:
-            self._set_status(
-                f"Live scan: {recognized} letters from {occupied} occupied cells. Score {score.total_score}."
-            )
+        self._handle_score_result(score)
+        self._set_status(f"Scanned {recognized} letters from {occupied} occupied cells.")
+        self._log(f"Board scan complete: {recognized} recognized, {occupied} occupied.")
 
     def _handle_score_result(self, score: ScoreResult) -> None:
         self._set_status(f"Board score: {score.total_score}")
@@ -850,66 +677,14 @@ class ScrabblePlotterApp:
         ok, frame = self._camera.read()
         if ok:
             self._latest_frame = frame
-            self._maybe_start_live_letter_scan(frame)
-            self._maybe_start_live_word_scan(frame)
             self._show_frame(frame)
         self._schedule_camera_update()
-
-    def _maybe_start_live_letter_scan(self, frame) -> None:  # type: ignore[no-untyped-def]
-        if not self.live_letter_scan_var.get() or self._live_letter_scan_running:
-            return
-
-        now = time.monotonic()
-        if now - self._last_live_letter_scan_at < LIVE_LETTER_SCAN_INTERVAL_SECONDS:
-            return
-        self._last_live_letter_scan_at = now
-
-        try:
-            confidence_threshold = self._ocr_confidence_threshold()
-        except Exception as exc:
-            self._handle_camera_letter_scan_error(exc)
-            return
-
-        self._live_letter_scan_running = True
-        thread = threading.Thread(
-            target=self._camera_letter_scan_worker,
-            args=(frame.copy(), confidence_threshold, False),
-            daemon=True,
-        )
-        thread.start()
-
-    def _maybe_start_live_word_scan(self, frame) -> None:  # type: ignore[no-untyped-def]
-        if not self.live_word_scan_var.get() or self._camera_word_scan_running:
-            return
-
-        now = time.monotonic()
-        if now - self._last_live_word_scan_at < LIVE_WORD_SCAN_INTERVAL_SECONDS:
-            return
-        self._last_live_word_scan_at = now
-
-        try:
-            confidence_threshold = self._ocr_confidence_threshold()
-        except Exception as exc:
-            self._handle_camera_word_scan_error(exc)
-            return
-
-        self._camera_word_scan_running = True
-        thread = threading.Thread(
-            target=self._camera_word_scan_worker,
-            args=(frame.copy(), confidence_threshold, False),
-            daemon=True,
-        )
-        thread.start()
 
     def _show_frame(self, frame) -> None:  # type: ignore[no-untyped-def]
         from PIL import Image, ImageTk
 
         cv2 = _require_cv2()
-        captured_letters = self._last_camera_letter_scan.letters if self._last_camera_letter_scan else []
-        detected_words = self._last_camera_word_scan.words if self._last_camera_word_scan else []
-        detected_tiles = self._last_camera_word_scan.tiles if self._last_camera_word_scan else []
-        display = draw_camera_ocr_overlay(frame.copy(), captured_letters, detected_words, detected_tiles)
-        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
         width = self.preview_label.winfo_width()
         height = self.preview_label.winfo_height()
@@ -928,7 +703,7 @@ class ScrabblePlotterApp:
         calibration.y_steps_per_mm = float(self.y_steps_per_mm_var.get())
         calibration.cart_x_mm = float(self.cart_x_var.get())
         calibration.cart_y_mm = float(self.cart_y_var.get())
-        calibration.ocr_confidence_threshold = float(self.ocr_confidence_threshold_var.get())
+        calibration.ocr_confidence_threshold = self._ocr_confidence_threshold()
         calibration.ocr_cell_size_px = int(self.ocr_cell_size_px_var.get())
         calibration.premium_layout = self._premium_layout_from_form()
         return calibration
@@ -980,14 +755,6 @@ class ScrabblePlotterApp:
             multiplier = f" x{word.word_multiplier}" if word.word_multiplier != 1 else ""
             lines.append(f"{word.word} {direction} {squares}: {word.base_score}{multiplier} = {word.score}")
         return "\n".join(lines)
-
-    def _set_camera_words_text(self, text: str) -> None:
-        if self.camera_words_text is None:
-            return
-        self.camera_words_text.configure(state="normal")
-        self.camera_words_text.delete("1.0", "end")
-        self.camera_words_text.insert("1.0", text)
-        self.camera_words_text.configure(state="disabled")
 
     def _ocr_confidence_threshold(self) -> float:
         threshold = float(self.ocr_confidence_threshold_var.get())

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 from pathlib import Path
 import unittest
@@ -536,12 +538,10 @@ class CliTests(unittest.TestCase):
         args = parser.parse_args(["gui"])
         self.assertEqual(args.command, "gui")
 
-    def test_scan_image_command_exists(self) -> None:
+    def test_scan_image_command_is_removed(self) -> None:
         parser = build_parser()
-        args = parser.parse_args(["scan-image", "--image", "board.jpg", "--calibration", "board.json"])
-        self.assertEqual(args.command, "scan-image")
-        self.assertEqual(args.image, "board.jpg")
-        self.assertEqual(args.calibration, "board.json")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["scan-image", "--image", "board.jpg", "--calibration", "board.json"])
 
     def test_set_offset_command_exists(self) -> None:
         parser = build_parser()

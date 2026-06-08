@@ -1041,6 +1041,15 @@ def _require_cv2():
 def _require_pytesseract():
     try:
         import pytesseract  # type: ignore
+        import platform
+        import os
+        # If we're on Windows and tesseract_cmd isn't pointing to a file, try the common installation folder
+        if platform.system() == "Windows":
+            current_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
+            if current_cmd == "tesseract" or not os.path.exists(str(current_cmd)):
+                common_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+                if os.path.exists(common_path):
+                    pytesseract.pytesseract.tesseract_cmd = common_path
     except ImportError as exc:
         raise RuntimeError(
             "pytesseract is required for offline OCR. Install scrabble_plotter/requirements.txt."
