@@ -628,6 +628,36 @@ def camera_grid_cells_from_ocr(
     ]
 
 
+def board_square_from_image_point(
+    corners: list[tuple[float, float]] | list[list[float]],
+    x: float,
+    y: float,
+    board_size: int = BOARD_SIZE,
+) -> str | None:
+    if len(corners) != 4:
+        return None
+
+    cv2 = _require_cv2()
+    image_to_board = cv2.getPerspectiveTransform(
+        _to_float32(corners),
+        _to_float32(board_corner_points(board_size)),
+    )
+    board_point = _transform_image_points([(float(x), float(y))], image_to_board)[0]
+    board_x, board_y = board_point
+    tolerance = 0.05
+    if (
+        board_x < -tolerance
+        or board_y < -tolerance
+        or board_x > board_size + tolerance
+        or board_y > board_size + tolerance
+    ):
+        return None
+
+    col = max(0, min(board_size - 1, int(board_x)))
+    row = max(0, min(board_size - 1, int(board_y)))
+    return square_label(row, col)
+
+
 def detect_board_grid_corners(frame) -> list[tuple[float, float]] | None:  # type: ignore[no-untyped-def]
     corners = _detect_board_corners_from_dark_grid(frame)
     if corners is not None:

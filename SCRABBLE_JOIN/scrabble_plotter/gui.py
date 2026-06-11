@@ -20,6 +20,7 @@ from .scanner import (
     BoardScanResult,
     CameraLetterScanResult,
     CameraWordScanResult,
+    board_square_from_image_point,
     format_camera_words_numbered,
     scan_board_image,
     scan_camera_letters,
@@ -58,6 +59,9 @@ class ScrabblePlotterApp:
         self.root.title("Scrabble Join")
         self.root.geometry("1240x820")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._z_axis_controls_frame = None
+        self.z_height_angle = tk.IntVar(value=80)
+        self.root.after(500, self._add_z_axis_controls_to_move_section)
 
         self.calibration_path = tk.StringVar(value=str(DEFAULT_CALIBRATION_PATH.resolve()))
         self._calibration = PlotterCalibration.load(self.calibration_path.get())
@@ -109,6 +113,8 @@ class ScrabblePlotterApp:
             value="Start the camera to find visible words."
         )
         self.preview_image = None
+        self._preview_display_size = (0, 0)
+        self._preview_source_size = (0, 0)
         self._camera = None
         self._camera_after_id: str | None = None
         self._latest_frame = None
@@ -172,6 +178,7 @@ class ScrabblePlotterApp:
 
         self.preview_label = ttk.Label(preview_frame, text="Camera stopped", anchor="center")
         self.preview_label.grid(row=2, column=0, columnspan=5, sticky="nsew", pady=(8, 0))
+        self.preview_label.bind("<Button-1>", self._handle_camera_preview_click)
 
         controls_container = ttk.Frame(frame)
         controls_container.grid(row=0, column=1, sticky="nsew")
@@ -319,6 +326,11 @@ class ScrabblePlotterApp:
                     borderwidth=1,
                 )
                 entry.grid(row=row + 1, column=col + 1, padx=1, pady=1)
+                entry.bind(
+                    "<Button-1>",
+                    lambda event, row=row, col=col: self._handle_ocr_board_cell_click(row, col),
+                    add="+",
+                )
                 entry.bind("<FocusOut>", lambda event: self._normalize_board_entries())
                 entry.bind("<Return>", lambda event: self.calculate_score_from_board())
                 entry_row.append(entry)
@@ -493,6 +505,8 @@ class ScrabblePlotterApp:
             self._invalidate_camera_scans()
             self.preview_label.configure(image="", text="Camera stopped")
             self.preview_image = None
+            self._preview_display_size = (0, 0)
+            self._preview_source_size = (0, 0)
 
     def calibrate_board_from_camera(self) -> None:
         if self._latest_frame is None:
@@ -525,6 +539,36 @@ class ScrabblePlotterApp:
     def send_move(self) -> None:
         try:
             self._send_square_move(self.square_var.get())
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _handle_ocr_board_cell_click(self, row: int, col: int) -> None:
+        square = f"{chr(ord('A') + col)}{row + 1}"
+        self._move_plotter_to_clicked_square(square, source="OCR grid")
+
+    def _handle_camera_preview_click(self, event) -> None:  # type: ignore[no-untyped-def]
+        grid = self._current_camera_ocr_grid()
+        if grid is None:
+            self._set_status("No auto-aligned OCR grid is visible yet. Capture letters or find words first.")
+            return
+
+        point = self._preview_click_to_frame_point(int(event.x), int(event.y))
+        if point is None:
+            self._set_status("Click inside the camera image to choose a board square.")
+            return
+
+        square = board_square_from_image_point(grid.corners, point[0], point[1], board_size=grid.board_size)
+        if square is None:
+            self._set_status("Click inside the detected board grid to move the plotter.")
+            return
+
+        self._move_plotter_to_clicked_square(square, source="camera grid")
+
+    def _move_plotter_to_clicked_square(self, square: str, source: str) -> None:
+        try:
+            self.square_var.set(square)
+            self._send_square_move(square)
+            self._log(f"Clicked {source} square {square}.")
         except Exception as exc:
             self._show_error(exc)
 
@@ -1096,6 +1140,8 @@ class ScrabblePlotterApp:
         self.stop_camera(clear_preview=True)
         self.preview_label.configure(image="", text="Camera frame unavailable")
         self.preview_image = None
+        self._preview_display_size = (0, 0)
+        self._preview_source_size = (0, 0)
         self._set_status(message)
         self._log(message)
 
@@ -1152,6 +1198,33 @@ class ScrabblePlotterApp:
             return self._captured_photo_frame
         return self._latest_frame
 
+    def _current_camera_ocr_grid(self):  # type: ignore[no-untyped-def]
+        if self._last_camera_word_scan is not None and self._last_camera_word_scan.grid is not None:
+            return self._last_camera_word_scan.grid
+        if self._last_camera_letter_scan is not None:
+            return self._last_camera_letter_scan.grid
+        return None
+
+    def _preview_click_to_frame_point(self, click_x: int, click_y: int) -> tuple[float, float] | None:
+        display_width, display_height = self._preview_display_size
+        source_width, source_height = self._preview_source_size
+        if display_width <= 0 or display_height <= 0 or source_width <= 0 or source_height <= 0:
+            return None
+
+        label_width = max(1, self.preview_label.winfo_width())
+        label_height = max(1, self.preview_label.winfo_height())
+        image_left = max(0.0, (label_width - display_width) / 2.0)
+        image_top = max(0.0, (label_height - display_height) / 2.0)
+        image_x = float(click_x) - image_left
+        image_y = float(click_y) - image_top
+        if image_x < 0 or image_y < 0 or image_x > display_width or image_y > display_height:
+            return None
+
+        return (
+            image_x * source_width / display_width,
+            image_y * source_height / display_height,
+        )
+
     def _refresh_camera_preview(self) -> None:
         frame = self._current_camera_ocr_frame()
         if frame is not None:
@@ -1178,11 +1251,7 @@ class ScrabblePlotterApp:
         captured_letters = self._last_camera_letter_scan.letters if self._last_camera_letter_scan else []
         detected_words = self._last_camera_word_scan.words if self._last_camera_word_scan else []
         detected_tiles = self._last_camera_word_scan.tiles if self._last_camera_word_scan else []
-        ocr_grid = None
-        if self._last_camera_word_scan is not None and self._last_camera_word_scan.grid is not None:
-            ocr_grid = self._last_camera_word_scan.grid
-        elif self._last_camera_letter_scan is not None:
-            ocr_grid = self._last_camera_letter_scan.grid
+        ocr_grid = self._current_camera_ocr_grid()
         display = draw_camera_ocr_overlay(
             frame.copy(),
             captured_letters,
@@ -1192,9 +1261,11 @@ class ScrabblePlotterApp:
         )
         rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
+        self._preview_source_size = (int(display.shape[1]), int(display.shape[0]))
         width = self.preview_label.winfo_width()
         height = self.preview_label.winfo_height()
         image.thumbnail((max(width, 700), max(height, 520)))
+        self._preview_display_size = image.size
         self.preview_image = ImageTk.PhotoImage(image)
         self.preview_label.configure(image=self.preview_image, text="")
 
@@ -1319,10 +1390,385 @@ class ScrabblePlotterApp:
         self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
 
+    def _add_z_axis_controls_to_move_section(self) -> None:
+        if self._z_axis_controls_frame is not None and self._z_axis_controls_frame.winfo_exists():
+            return
+
+        parent = self._find_move_plotter_section() or self.root
+        controls = ttk.LabelFrame(parent, text="Z Movement / Relay Magnet", padding=10)
+        self._z_axis_controls_frame = controls
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Label(controls, text="Down height").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        tk.Spinbox(
+            controls,
+            from_=0,
+            to=180,
+            increment=1,
+            textvariable=self.z_height_angle,
+            width=6,
+        ).grid(row=0, column=1, sticky="ew")
+        ttk.Button(controls, text="Set Height", command=self._send_z_height_command).grid(
+            row=0, column=2, sticky="ew", padx=(8, 0)
+        )
+
+        ttk.Scale(
+            controls,
+            from_=0,
+            to=180,
+            variable=self.z_height_angle,
+            orient="horizontal",
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+
+        ttk.Button(controls, text="Z Down", command=lambda: self._send_auxiliary_command("ZD")).grid(
+            row=2, column=0, sticky="ew", padx=(0, 6), pady=(10, 0)
+        )
+        ttk.Button(controls, text="Z Up", command=lambda: self._send_auxiliary_command("ZU")).grid(
+            row=2, column=1, sticky="ew", padx=(0, 6), pady=(10, 0)
+        )
+        ttk.Button(
+            controls,
+            text="Relay ON",
+            command=lambda: self._send_auxiliary_command("R1"),
+        ).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(8, 0))
+        ttk.Button(
+            controls,
+            text="Relay OFF",
+            command=lambda: self._send_auxiliary_command("R0"),
+        ).grid(row=3, column=1, sticky="ew", padx=(0, 6), pady=(8, 0))
+        ttk.Label(controls, text="A2 controls the relay input").grid(
+            row=3, column=2, sticky="w", pady=(8, 0)
+        )
+
+        self._place_z_axis_controls(parent, controls)
+
+    def _find_move_plotter_section(self):
+        candidates = []
+        for widget in self._walk_widgets(self.root):
+            text = self._widget_text(widget).lower()
+            if "move plotter" in text:
+                return widget if self._looks_like_container(widget) else self._nearest_container(widget)
+            if "plotter" in text and "move" in text:
+                section = widget if self._looks_like_container(widget) else self._nearest_container(widget)
+                if section is not None:
+                    candidates.append((0, section))
+            elif "move" in text:
+                section = widget if self._looks_like_container(widget) else self._nearest_container(widget)
+                if section is not None:
+                    candidates.append((1, section))
+            elif "send move" in text:
+                section = self._nearest_container(widget)
+                if section is not None:
+                    candidates.append((0, section))
+
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1]
+        return None
+
+    def _walk_widgets(self, widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from self._walk_widgets(child)
+
+    def _widget_text(self, widget) -> str:
+        try:
+            return str(widget.cget("text"))
+        except Exception:
+            return ""
+
+    def _looks_like_container(self, widget) -> bool:
+        class_name = widget.winfo_class().lower()
+        return "frame" in class_name or "notebook" in class_name or "pane" in class_name
+
+    def _nearest_container(self, widget):
+        parent = getattr(widget, "master", None)
+        while parent is not None and parent is not self.root:
+            text = self._widget_text(parent).lower()
+            if "move" in text or "plotter" in text:
+                return parent
+            parent = getattr(parent, "master", None)
+        return getattr(widget, "master", None)
+
+    def _place_z_axis_controls(self, parent, controls) -> None:
+        managers = [child.winfo_manager() for child in parent.winfo_children() if child is not controls]
+        if "grid" in managers:
+            rows = []
+            for child in parent.winfo_children():
+                if child is controls or child.winfo_manager() != "grid":
+                    continue
+                try:
+                    rows.append(int(child.grid_info().get("row", 0)))
+                except Exception:
+                    pass
+            controls.grid(row=(max(rows) + 1 if rows else 0), column=0, columnspan=3, sticky="ew", pady=(10, 0))
+            try:
+                parent.columnconfigure(0, weight=1)
+            except Exception:
+                pass
+        elif "pack" in managers:
+            controls.pack(fill="x", pady=(10, 0))
+        else:
+            controls.grid(row=0, column=0, sticky="ew", pady=(10, 0))
+
+    def _send_z_height_command(self) -> None:
+        angle = int(float(self.z_height_angle.get()))
+        angle = max(0, min(180, angle))
+        self.z_height_angle.set(angle)
+        self._send_auxiliary_command(f"ZH{angle}")
+
+    def _send_auxiliary_command(self, command: str) -> None:
+        try:
+            self._write_auxiliary_serial_line(command)
+            log = getattr(self, "_log", None)
+            if callable(log):
+                log(f"Sent auxiliary command: {command}")
+            set_status = getattr(self, "_set_status", None)
+            if callable(set_status):
+                set_status(f"Sent {command}")
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _write_auxiliary_serial_line(self, command: str) -> None:
+        attempted = []
+        for sender in self._serial_sender_candidates():
+            for method_name in ("send_line", "send_lines", "send_command", "send_gcode", "send", "write_line", "write"):
+                method = getattr(sender, method_name, None)
+                if not callable(method):
+                    continue
+                attempted.append(f"{sender.__class__.__name__}.{method_name}")
+                payloads = [command]
+                if method_name == "send_lines":
+                    payloads = [[command]]
+                elif method_name == "write":
+                    payloads = [command + "\n", (command + "\n").encode("ascii")]
+                for payload in payloads:
+                    try:
+                        method(payload)
+                        return
+                    except TypeError:
+                        continue
+                    except Exception:
+                        raise
+
+        if self._send_auxiliary_with_gcode_sender(command):
+            return
+
+        if self._send_auxiliary_with_pyserial(command):
+            return
+
+        details = ", ".join(attempted) if attempted else "no serial sender object found"
+        raise RuntimeError(
+            "Connect to the Arduino first, then try the Z/electromagnet control again "
+            f"({details})."
+        )
+
+    def _serial_sender_candidates(self):
+        names = (
+            "sender",
+            "_sender",
+            "gcode_sender",
+            "_gcode_sender",
+            "serial_sender",
+            "_serial_sender",
+            "serial",
+            "_serial",
+            "connection",
+            "_connection",
+        )
+        seen = set()
+        for name in names:
+            sender = getattr(self, name, None)
+            if sender is not None and id(sender) not in seen:
+                seen.add(id(sender))
+                yield sender
+
+        for sender in vars(self).values():
+            if sender is None or id(sender) in seen:
+                continue
+            class_name = sender.__class__.__name__.lower()
+            if "sender" in class_name or "serial" in class_name or "gcode" in class_name:
+                seen.add(id(sender))
+                yield sender
+
+    def _send_auxiliary_with_gcode_sender(self, command: str) -> bool:
+        port = self._selected_serial_port()
+        if not port:
+            return False
+
+        baud_rate = self._selected_baud_rate()
+        config = self._build_serial_config(port, baud_rate)
+        if config is None:
+            return False
+
+        sender = GCodeSender(config)
+        try:
+            for method_name in (
+                "send_line",
+                "send_lines",
+                "send_command",
+                "send_commands",
+                "send_gcode",
+                "send",
+                "write_line",
+            ):
+                method = getattr(sender, method_name, None)
+                if not callable(method):
+                    continue
+                payload = [command] if method_name in {"send_lines", "send_commands"} else command
+                try:
+                    method(payload)
+                    return True
+                except TypeError:
+                    continue
+        except Exception:
+            raise
+        finally:
+            close = getattr(sender, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        return False
+
+    def _send_auxiliary_with_pyserial(self, command: str) -> bool:
+        port = self._selected_serial_port()
+        if not port:
+            return False
+
+        try:
+            import serial
+        except Exception:
+            return False
+
+        import time
+
+        baud_rate = self._selected_baud_rate()
+        with serial.Serial(port=port, baudrate=baud_rate, timeout=2, write_timeout=2) as connection:
+            time.sleep(2.0)
+            connection.write((command + "\n").encode("ascii"))
+            connection.flush()
+        return True
+
+    def _build_serial_config(self, port: str, baud_rate: int):
+        try:
+            import inspect
+
+            signature = inspect.signature(SerialConfig)
+            kwargs = {}
+            for name in signature.parameters:
+                key = name.lower()
+                if key == "port":
+                    kwargs[name] = port
+                elif key in {"baud", "baudrate", "baud_rate"}:
+                    kwargs[name] = baud_rate
+                elif key == "timeout":
+                    kwargs[name] = 2
+                elif key == "write_timeout":
+                    kwargs[name] = 2
+            if kwargs:
+                return SerialConfig(**kwargs)
+        except Exception:
+            pass
+
+        for args in ((port, baud_rate), (port,)):
+            try:
+                return SerialConfig(*args)
+            except TypeError:
+                continue
+        return None
+
+    def _selected_serial_port(self) -> str:
+        import re
+
+        preferred_names = (
+            "port_var",
+            "serial_port_var",
+            "com_port_var",
+            "selected_port",
+            "selected_port_var",
+            "port",
+        )
+        for name in preferred_names:
+            value = self._string_value(getattr(self, name, None))
+            match = re.search(r"\bCOM\d+\b", value or "", flags=re.IGNORECASE)
+            if match:
+                return match.group(0).upper()
+
+        for name, value_source in vars(self).items():
+            if "port" not in name.lower() and "com" not in name.lower():
+                continue
+            value = self._string_value(value_source)
+            match = re.search(r"\bCOM\d+\b", value or "", flags=re.IGNORECASE)
+            if match:
+                return match.group(0).upper()
+
+        return ""
+
+    def _selected_baud_rate(self) -> int:
+        preferred_names = ("baud_var", "baudrate_var", "baud_rate_var", "baud", "baudrate")
+        for name in preferred_names:
+            value = self._string_value(getattr(self, name, None))
+            baud = self._parse_baud_rate(value)
+            if baud:
+                return baud
+
+        for name, value_source in vars(self).items():
+            if "baud" not in name.lower():
+                continue
+            value = self._string_value(value_source)
+            baud = self._parse_baud_rate(value)
+            if baud:
+                return baud
+
+        return 115200
+
+    def _string_value(self, value_source) -> str:
+        if value_source is None:
+            return ""
+        getter = getattr(value_source, "get", None)
+        if callable(getter):
+            try:
+                return str(getter())
+            except Exception:
+                return ""
+        return str(value_source)
+
+    def _parse_baud_rate(self, value: str) -> int:
+        try:
+            baud = int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return 0
+        if baud in {9600, 19200, 38400, 57600, 115200, 230400, 250000}:
+            return baud
+        return 0
+
     def _show_error(self, exc: Exception) -> None:
-        self._set_status(str(exc))
-        self._log("Error: " + str(exc))
-        messagebox.showerror("Scrabble Join", str(exc))
+        message = self._format_user_error(exc)
+        self._set_status(message)
+        self._log("Error: " + message)
+        messagebox.showerror("Scrabble Join", message)
+
+    def _format_user_error(self, exc: Exception) -> str:
+        message = str(exc)
+        lowered = message.lower()
+        if (
+            "cannot configure port" in lowered
+            or "permissionerror(13" in lowered
+            or "a device attached to the system is not functioning" in lowered
+        ):
+            return (
+                message
+                + "\n\n"
+                + "This means Windows could not open the selected Arduino COM port. "
+                + "Close Arduino IDE Serial Monitor/Plotter and any other program using the board, "
+                + "unplug and reconnect the USB cable, press Refresh Ports, then select the Arduino COM port again. "
+                + "Use 115200 baud for the updated Arduino sketch. If the same COM port still fails, check Device Manager "
+                + "and reinstall the CH340/Arduino USB driver or try another USB cable/port."
+            )
+        return message
 
 
 def _require_cv2():

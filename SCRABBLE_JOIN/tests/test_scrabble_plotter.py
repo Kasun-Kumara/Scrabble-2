@@ -26,6 +26,7 @@ from scrabble_plotter.scanner import (
     CameraTile,
     CameraWord,
     PaddleOcrTextBox,
+    board_square_from_image_point,
     build_camera_ocr_grid,
     detect_camera_tiles,
     detect_board_corners,
@@ -674,6 +675,17 @@ class ScannerTests(unittest.TestCase):
         self.assertIsNotNone(grid)
         assert grid is not None
         self.assertEqual(grid.board_letters()[0][:3], ["C", "A", "T"])
+
+    def test_board_square_from_image_point_maps_detected_grid_click(self) -> None:
+        _, board_corners = _synthetic_camera_board_image()
+        a1_center, l12_center = project_board_points(
+            board_corners,
+            [(0.5, 0.5), (11.5, 11.5)],
+        )
+
+        self.assertEqual(board_square_from_image_point(board_corners, *a1_center), "A1")
+        self.assertEqual(board_square_from_image_point(board_corners, *l12_center), "L12")
+        self.assertIsNone(board_square_from_image_point(board_corners, 10.0, 10.0))
 
     def test_scan_camera_words_returns_board_aligned_grid(self) -> None:
         image, board_corners = _synthetic_camera_board_image()
