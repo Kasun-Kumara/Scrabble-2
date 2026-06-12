@@ -20,6 +20,7 @@ from scrabble_plotter.gemini_agent import (
     format_detected_words_numbered,
     parse_detected_words,
 )
+from scrabble_plotter.gui import ScrabblePlotterApp
 from scrabble_plotter.main import build_parser
 from scrabble_plotter.overlay import cell_label_positions, grid_segments, project_board_points
 from scrabble_plotter.scanner import (
@@ -45,7 +46,13 @@ from scrabble_plotter.scanner import (
     select_best_frame,
 )
 from scrabble_plotter.scoring import LETTER_VALUES, score_board, square_label
-from scrabble_plotter.serial_sender import format_move_command, format_reset_command, format_steps_command
+from scrabble_plotter.serial_sender import (
+    GCodeSender,
+    SerialConfig,
+    format_move_command,
+    format_reset_command,
+    format_steps_command,
+)
 from scrabble_plotter.word_bank import (
     generated_reference_word_set,
     generated_reference_words,
@@ -853,6 +860,58 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(args.command, "move")
         self.assertEqual(args.gcode_command, "G1")
+
+
+class _FakeSerialConnection:
+    def __init__(self, responses: list[str]):
+        self.responses = list(responses)
+        self.writes: list[str] = []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data.decode("utf-8"))
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> bytes:
+        if not self.responses:
+            return b""
+        return self.responses.pop(0).encode("utf-8")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class SerialSenderTests(unittest.TestCase):
+    def test_auxiliary_command_can_reuse_open_connection_without_startup_g90(self) -> None:
+        connection = _FakeSerialConnection(["OK Z UP\n"])
+        sender = GCodeSender(SerialConfig(port="COM20", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.send_command("ZU", startup_g90=False)
+
+        self.assertEqual(connection.writes, ["ZU\n"])
+        self.assertEqual(responses, ["OK Z UP"])
+        self.assertFalse(connection.closed)
+
+    def test_auxiliary_gui_command_uses_current_sender(self) -> None:
+        class RecordingSender:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, bool | None]] = []
+
+            def send_command(self, command: str, *, startup_g90: bool | None = None) -> list[str]:
+                self.calls.append((command, startup_g90))
+                return ["OK MAGNET ON"]
+
+        app = type("App", (), {})()
+        app.sender = RecordingSender()
+        app._get_sender = lambda: app.sender
+
+        responses = ScrabblePlotterApp._write_auxiliary_serial_line(app, "R1")
+
+        self.assertEqual(app.sender.calls, [("R1", False)])
+        self.assertEqual(responses, ["OK MAGNET ON"])
 
 
 class _FakeFrame:

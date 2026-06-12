@@ -77,6 +77,9 @@ class GCodeSender:
         responses = self.send_commands([command])
         return command, responses
 
+    def send_command(self, command: str, *, startup_g90: bool | None = None) -> list[str]:
+        return self.send_commands([command], startup_g90=startup_g90)
+
     def open(self) -> None:
         if self._connection is not None:
             return
@@ -104,7 +107,7 @@ class GCodeSender:
         finally:
             self._connection = None
 
-    def send_commands(self, commands: list[str]) -> list[str]:
+    def send_commands(self, commands: list[str], *, startup_g90: bool | None = None) -> list[str]:
         should_close = self._connection is None
         if should_close:
             self.open()
@@ -114,7 +117,8 @@ class GCodeSender:
             raise RuntimeError("Serial connection could not be opened.")
 
         try:
-            if self.config.startup_g90:
+            should_send_startup_g90 = self.config.startup_g90 if startup_g90 is None else startup_g90
+            if should_send_startup_g90:
                 self._write_line(connection, "G90")
                 self._read_responses(connection)
 
@@ -144,6 +148,7 @@ class GCodeSender:
             if not message:
                 continue
             responses.append(message)
-            if message.lower() == "ok":
+            lowered = message.lower()
+            if lowered == "ok" or lowered.startswith("ok ") or lowered.startswith("err"):
                 break
         return responses
