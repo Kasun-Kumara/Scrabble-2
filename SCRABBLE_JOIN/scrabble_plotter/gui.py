@@ -51,6 +51,11 @@ BEST_CAPTURE_FRAME_COUNT = 18
 BEST_CAPTURE_TIMEOUT_SECONDS = 1.0
 BEST_CAPTURE_FRAME_DELAY_SECONDS = 0.025
 CAMERA_READ_FAILURE_LIMIT = 10
+PICK_DROP_Z_SETTLE_SECONDS = 0.8
+PICK_DROP_MAGNET_SETTLE_SECONDS = 1.0
+PICK_DROP_LIFT_RETRY_SECONDS = 0.35
+Z_DOWN_COMMAND = "ZU"
+Z_UP_COMMAND = "ZD"
 
 
 class ScrabblePlotterApp:
@@ -77,6 +82,8 @@ class ScrabblePlotterApp:
         self.ocr_confidence_threshold_var = tk.StringVar(value=str(self._calibration.ocr_confidence_threshold))
         self.ocr_cell_size_px_var = tk.StringVar(value=str(self._calibration.ocr_cell_size_px))
         self.square_var = tk.StringVar(value="H8")
+        self.pick_square_var = tk.StringVar(value="A1")
+        self.drop_square_var = tk.StringVar(value="H8")
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
         self.feed_rate_var = tk.StringVar(value="1500")
@@ -249,6 +256,8 @@ class ScrabblePlotterApp:
 
         move_fields = [
             ("Square", self.square_var),
+            ("Pick Square", self.pick_square_var),
+            ("Drop Square", self.drop_square_var),
             ("COM Port", self.port_var),
             ("Baud", self.baud_var),
             ("Feed Rate", self.feed_rate_var),
@@ -261,20 +270,24 @@ class ScrabblePlotterApp:
             if label == "COM Port":
                 ttk.Button(move_box, text="Refresh", command=self.refresh_ports).grid(row=index, column=2, sticky="ew")
 
+        next_move_row = len(move_fields)
         ttk.Checkbutton(move_box, text="Send G90 before move", variable=self.startup_g90_var).grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(8, 0)
+            row=next_move_row, column=0, columnspan=3, sticky="w", pady=(8, 0)
         )
         ttk.Button(move_box, text="Preview G-code", command=self.preview_move).grid(
-            row=7, column=0, columnspan=3, sticky="ew", pady=(10, 6)
+            row=next_move_row + 1, column=0, columnspan=3, sticky="ew", pady=(10, 6)
         )
         ttk.Button(move_box, text="Send Move", command=self.send_move).grid(
-            row=8, column=0, columnspan=3, sticky="ew"
+            row=next_move_row + 2, column=0, columnspan=3, sticky="ew"
         )
         ttk.Button(move_box, text="Reset To Start", command=self.reset_to_start).grid(
-            row=9, column=0, columnspan=3, sticky="ew", pady=(8, 0)
+            row=next_move_row + 3, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
         ttk.Button(move_box, text="Go To Cart", command=self.go_to_cart).grid(
-            row=10, column=0, columnspan=3, sticky="ew", pady=(8, 0)
+            row=next_move_row + 4, column=0, columnspan=3, sticky="ew", pady=(8, 0)
+        )
+        ttk.Button(move_box, text="Pick And Drop", command=self.pick_and_drop).grid(
+            row=next_move_row + 5, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
 
         scan_box = ttk.LabelFrame(controls, text="Camera OCR", padding=10)
@@ -539,6 +552,12 @@ class ScrabblePlotterApp:
     def send_move(self) -> None:
         try:
             self._send_square_move(self.square_var.get())
+        except Exception as exc:
+            self._show_error(exc)
+
+    def pick_and_drop(self) -> None:
+        try:
+            self._send_pick_and_drop(self.pick_square_var.get(), self.drop_square_var.get())
         except Exception as exc:
             self._show_error(exc)
 
@@ -1090,6 +1109,65 @@ class ScrabblePlotterApp:
         if responses:
             self._log("Responses: " + " | ".join(responses))
 
+    def _send_pick_and_drop(self, pick_square_label: str, drop_square_label: str) -> None:
+        calibration = self._calibration_from_form()
+        calibration.validate_ready_for_move()
+        pick_square = parse_square_label(pick_square_label)
+        drop_square = parse_square_label(drop_square_label)
+        feed_rate = self._optional_float(self.feed_rate_var.get())
+        command = self.command_var.get().strip() or "G0"
+        pick_x, pick_y = calibration.square_center_in_machine(pick_square)
+        drop_x, drop_y = calibration.square_center_in_machine(drop_square)
+
+        sender = self._get_sender()
+        self._send_pick_drop_move(sender, pick_x, pick_y, feed_rate, command)
+        self._send_pick_drop_auxiliary(sender, Z_DOWN_COMMAND)
+        self._pick_drop_wait(PICK_DROP_Z_SETTLE_SECONDS)
+        self._send_pick_drop_auxiliary(sender, "M1")
+        self._pick_drop_wait(PICK_DROP_MAGNET_SETTLE_SECONDS)
+        self._send_pick_drop_auxiliary(sender, Z_UP_COMMAND)
+        self._pick_drop_wait(PICK_DROP_LIFT_RETRY_SECONDS)
+        self._send_pick_drop_auxiliary(sender, Z_UP_COMMAND)
+        self._pick_drop_wait(PICK_DROP_Z_SETTLE_SECONDS)
+        self._send_pick_drop_move(sender, drop_x, drop_y, feed_rate, command)
+        self._send_pick_drop_auxiliary(sender, Z_DOWN_COMMAND)
+        self._pick_drop_wait(PICK_DROP_Z_SETTLE_SECONDS)
+        self._send_pick_drop_auxiliary(sender, "M0")
+
+        self._set_status(f"Pick/drop complete: {pick_square.label} -> {drop_square.label}")
+
+    def _send_pick_drop_move(
+        self,
+        sender: GCodeSender,
+        x: float,
+        y: float,
+        feed_rate: float | None,
+        command: str,
+    ) -> None:
+        gcode, responses = sender.send_move(x, y, feed_rate=feed_rate, command=command)
+        self._log(f"Sent: {gcode}")
+        if responses:
+            self._log("Responses: " + " | ".join(responses))
+        self._raise_for_pick_drop_error(gcode, responses)
+
+    def _send_pick_drop_auxiliary(self, sender: GCodeSender, command: str) -> None:
+        responses = sender.send_command(command, startup_g90=False)
+        self._log(f"Sent auxiliary command: {command}")
+        if responses:
+            self._log("Responses: " + " | ".join(responses))
+        self._raise_for_pick_drop_error(command, responses)
+
+    def _raise_for_pick_drop_error(self, command: str, responses: list[str]) -> None:
+        if not responses:
+            raise RuntimeError(f"No Arduino response after {command}; stopped pick/drop sequence.")
+        for response in responses:
+            lowered = response.lower()
+            if lowered.startswith("err") or lowered.startswith("error"):
+                raise RuntimeError(f"Arduino rejected {command}: {response}")
+
+    def _pick_drop_wait(self, seconds: float) -> None:
+        time.sleep(seconds)
+
     def _send_reset(self) -> None:
         sender = self._get_sender()
         command, responses = sender.send_reset()
@@ -1420,21 +1498,21 @@ class ScrabblePlotterApp:
             orient="horizontal",
         ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
-        ttk.Button(controls, text="Z Down", command=lambda: self._send_auxiliary_command("ZD")).grid(
+        ttk.Button(controls, text="Z Down", command=lambda: self._send_auxiliary_command(Z_DOWN_COMMAND)).grid(
             row=2, column=0, sticky="ew", padx=(0, 6), pady=(10, 0)
         )
-        ttk.Button(controls, text="Z Up", command=lambda: self._send_auxiliary_command("ZU")).grid(
+        ttk.Button(controls, text="Z Up", command=lambda: self._send_auxiliary_command(Z_UP_COMMAND)).grid(
             row=2, column=1, sticky="ew", padx=(0, 6), pady=(10, 0)
         )
         ttk.Button(
             controls,
-            text="Relay ON",
-            command=lambda: self._send_auxiliary_command("R1"),
+            text="Magnet ON",
+            command=lambda: self._send_auxiliary_command("M1"),
         ).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(8, 0))
         ttk.Button(
             controls,
-            text="Relay OFF",
-            command=lambda: self._send_auxiliary_command("R0"),
+            text="Magnet OFF",
+            command=lambda: self._send_auxiliary_command("M0"),
         ).grid(row=3, column=1, sticky="ew", padx=(0, 6), pady=(8, 0))
         ttk.Label(controls, text="A2 controls the relay input").grid(
             row=3, column=2, sticky="w", pady=(8, 0)
