@@ -35,13 +35,6 @@ from .scoring import (
     premium_short_label,
     score_board,
 )
-from .tile_rack import (
-    can_build_word_from_rack,
-    horizontal_word_squares,
-    normalize_rack_letters,
-    normalize_word,
-    rack_slot_indices_for_word,
-)
 from .serial_sender import (
     GCodeSender,
     SerialConfig,
@@ -71,6 +64,7 @@ class ScrabblePlotterApp:
         self.root.title("Scrabble Join")
         self.root.geometry("1240x820")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(800, self._send_startup_z_up)
         self._z_axis_controls_frame = None
         self.z_height_angle = tk.IntVar(value=80)
         self.root.after(500, self._add_z_axis_controls_to_move_section)
@@ -324,7 +318,7 @@ class ScrabblePlotterApp:
         ttk.Button(scan_buttons, text="Calculate Score", command=self.calculate_score_from_board).grid(
             row=1, column=2, sticky="ew", pady=(6, 0)
         )
-        ttk.Button(scan_buttons, text="Tile Rack", command=self.open_tile_rack_window).grid(
+        ttk.Button(scan_buttons, text="Tile Rack Position", command=self.open_tile_rack_position_window).grid(
             row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0)
         )
 
@@ -561,11 +555,269 @@ class ScrabblePlotterApp:
 
     def send_move(self) -> None:
         try:
-            self._send_square_move(self.square_var.get())
+            self._send_move_target(self.square_var.get())
         except Exception as exc:
             self._show_error(exc)
 
+    def _send_move_target(self, target: str) -> None:
+        target = str(target).strip().upper()
+        if self._is_tile_rack_target(target):
+            self._send_tile_rack_target_move(target)
+            return
+        self._send_square_move(target)
+
+    def _is_tile_rack_target(self, target: str) -> bool:
+        return (
+            len(target) >= 3
+            and target[:2] == "TR"
+            and target[2:].isdigit()
+            and 1 <= int(target[2:]) <= 7
+        )
+
+    def _send_tile_rack_target_move(self, target: str) -> None:
+        self._ensure_tile_rack_move_state()
+        self._send_pick_drop_aux_command("ZU")
+        slot_index = int(target[2:]) - 1
+        x, y = self._tile_rack_slot_position(slot_index)
+        feed = float(self.tile_rack_feed_var.get())
+        command = f"G0 X{x:g} Y{y:g} F{feed:g}"
+        self._send_tile_rack_move_command(command)
+        self._set_status(f"Moved to {target} at X{x:g} Y{y:g}.")
+        self._log(command)
+
+    def _move_to_tile_rack_target_from_button(self, target: str) -> None:
+        try:
+            self._send_tile_rack_target_move(target)
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _tile_rack_slot_position(self, slot_index: int) -> tuple[float, float]:
+        if slot_index < 0 or slot_index >= 7:
+            raise ValueError("Tile rack target must be TR1 through TR7.")
+        rack_x = float(self.tile_rack_tr1_x_var.get())
+        rack_y = float(self.tile_rack_tr1_y_var.get())
+        tile_size = float(self.tile_rack_tile_size_var.get())
+        return rack_x, rack_y + tile_size * slot_index
+
+    def _ensure_tile_rack_move_state(self) -> None:
+        if getattr(self, "_tile_rack_move_state_ready", False):
+            return
+
+        default_feed = "1500"
+        feed_var = getattr(self, "feed_rate_var", None)
+        if feed_var is not None:
+            try:
+                default_feed = str(feed_var.get())
+            except Exception:
+                default_feed = "1500"
+
+        self.tile_rack_tr1_x_var = tk.StringVar(value="335")
+        self.tile_rack_tr1_y_var = tk.StringVar(value="30")
+        self.tile_rack_tile_size_var = tk.StringVar(value="10")
+        self.tile_rack_feed_var = tk.StringVar(value=default_feed)
+        self.tile_rack_status_var = tk.StringVar(value="Enter TR1 to TR7 in Move Plotter to go to rack slots.")
+        self._tile_rack_move_state_ready = True
+
+    def _send_tile_rack_move_command(self, command: str) -> None:
+        for method_name in (
+            "_send_commands",
+            "_send_serial_commands",
+            "_send_controller_commands",
+            "_send_gcode_commands",
+            "_send_command_lines",
+            "_send_gcode_lines",
+            "_send_to_plotter",
+            "_send_to_controller",
+            "_send_serial",
+            "_send_gcode",
+            "_send_plotter_command",
+            "_send_controller_command",
+            "_send_raw_command",
+            "_send_manual_command",
+            "_send_command",
+            "_send_gcode_command",
+            "send_commands",
+            "send_serial_commands",
+            "send_controller_commands",
+            "send_gcode_commands",
+            "send_command_lines",
+            "send_gcode_lines",
+            "send_to_plotter",
+            "send_to_controller",
+            "send_serial",
+            "send_gcode",
+            "send_plotter_command",
+            "send_controller_command",
+            "send_raw_command",
+            "send_manual_command",
+            "send_command",
+            "send_gcode_command",
+        ):
+            method = getattr(self, method_name, None)
+            if not callable(method):
+                continue
+            if "commands" in method_name or "lines" in method_name:
+                payloads = (
+                    ([command],),
+                    ([command], "tile rack move"),
+                    (command,),
+                    (command, "tile rack move"),
+                )
+            else:
+                payloads = (
+                    (command,),
+                    (command, "tile rack move"),
+                )
+            for payload in payloads:
+                try:
+                    method(*payload)
+                    return
+                except TypeError:
+                    continue
+
+        for method_name in dir(self):
+            lowered = method_name.lower()
+            if (
+                method_name in {
+                    "send_move",
+                    "reset_to_start",
+                    "_send_square_move",
+                    "_send_move_target",
+                    "_send_reset",
+                    "_send_tile_rack_move_command",
+                    "_send_tile_rack_move_with_gcode_sender",
+                    "_send_tile_rack_target_move",
+                    "_move_to_tile_rack_target_from_button",
+                }
+                or ("send" not in lowered and "command" not in lowered and "gcode" not in lowered)
+            ):
+                continue
+            method = getattr(self, method_name, None)
+            if not callable(method):
+                continue
+            if "commands" in lowered or "lines" in lowered:
+                payloads = (([command],), (command,))
+            else:
+                payloads = ((command,),)
+            for payload in payloads:
+                try:
+                    method(*payload)
+                    return
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+
+        raise RuntimeError("Could not find the plotter command sender for tile rack movement.")
+
+    def _pick_and_drop_from_tile_rack_target(self) -> bool:
+        rack_target, board_target = self._tile_rack_pick_drop_targets()
+        if rack_target is None:
+            return False
+        if board_target is None:
+            raise ValueError("Enter the board drop square as A1 to L12.")
+
+        self._set_status(f"Picking from {rack_target} and dropping on {board_target}...")
+        self._log(f"Rack pickup through normal pick/drop: {rack_target} -> {board_target}")
+        self._send_pick_drop_aux_command("ZU")
+        self._send_tile_rack_target_move(rack_target)
+        self._send_pick_drop_aux_command("ZD")
+        self._send_pick_drop_aux_command("R1")
+        self._send_pick_drop_aux_command("ZU")
+        self._send_square_move(board_target)
+        self._send_pick_drop_aux_command("ZD")
+        self._send_pick_drop_aux_command("R0")
+        self._send_pick_drop_aux_command("ZU")
+        self._set_status(f"Picked from {rack_target} and dropped on {board_target}.")
+        return True
+
+    def _tile_rack_pick_drop_targets(self) -> tuple[str | None, str | None]:
+        values: list[tuple[str, str]] = []
+        for name, source in vars(self).items():
+            if not hasattr(source, "get"):
+                continue
+            try:
+                value = source.get()
+            except Exception:
+                continue
+            text = str(value).strip()
+            if text:
+                values.append((name.lower(), text))
+
+        source_words = ("pick", "pickup", "from", "source")
+        drop_words = ("drop", "to", "target", "destination", "place")
+
+        rack_target = None
+        for name, text in values:
+            if any(word in name for word in source_words) and self._is_tile_rack_target(text.upper()):
+                rack_target = text.upper()
+                break
+        if rack_target is None:
+            for _name, text in values:
+                if self._is_tile_rack_target(text.upper()):
+                    rack_target = text.upper()
+                    break
+        if rack_target is None:
+            return None, None
+
+        board_target = None
+        for name, text in values:
+            if any(word in name for word in drop_words) and self._looks_like_board_square(text):
+                board_target = text.upper()
+                break
+        if board_target is None:
+            for name, text in values:
+                if "rack" not in name and self._looks_like_board_square(text):
+                    board_target = text.upper()
+                    break
+        return rack_target, board_target
+
+    def _looks_like_board_square(self, value: object) -> bool:
+        text = str(value).strip().upper()
+        if len(text) < 2:
+            return False
+        column = text[0]
+        row = text[1:]
+        return column in "ABCDEFGHIJKL" and row.isdigit() and 1 <= int(row) <= 12
+
+    def _send_pick_drop_aux_command(self, command: str) -> None:
+        writer = getattr(self, "_write_auxiliary_serial_line", None)
+        if callable(writer):
+            writer(command)
+            self._log(f"Sent auxiliary command: {command}")
+            return
+
+        sender = getattr(self, "_send_auxiliary_command", None)
+        if callable(sender):
+            sender(command)
+            return
+
+        raise RuntimeError("Could not find the Z movement or relay command sender.")
+
+    def _send_startup_z_up(self) -> None:
+        try:
+            self._send_pick_drop_aux_command("ZU")
+            self._log("Startup Z up command sent.")
+        except Exception as exc:
+            log = getattr(self, "_log", None)
+            if callable(log):
+                log(f"Startup Z up command skipped: {exc}")
+
     def pick_and_drop(self) -> None:
+        try:
+            if self._pick_and_drop_from_tile_rack_target():
+                return
+            previous_force_z_up = getattr(self, "_force_z_up_before_pick_drop_move", False)
+            self._force_z_up_before_pick_drop_move = True
+            try:
+                self._pick_and_drop_board_only()
+                self._send_pick_drop_aux_command("ZU")
+            finally:
+                self._force_z_up_before_pick_drop_move = previous_force_z_up
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _pick_and_drop_board_only(self) -> None:
         try:
             self._send_pick_and_drop(self.pick_square_var.get(), self.drop_square_var.get())
         except Exception as exc:
@@ -601,7 +853,757 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self._show_error(exc)
 
+    def _send_tile_rack_move_with_gcode_sender(self, command: str) -> bool:
+        return False
+
+        try:
+            config = self._tile_rack_move_serial_config()
+        except Exception:
+            return False
+
+        if not self._tile_rack_move_config_has_port(config):
+            return False
+
+        try:
+            sender = GCodeSender(config)
+            if hasattr(sender, "__enter__") and hasattr(sender, "__exit__"):
+                with sender as active_sender:
+                    return self._send_tile_rack_move_to_sender(active_sender, command)
+            try:
+                return self._send_tile_rack_move_to_sender(sender, command)
+            finally:
+                close = getattr(sender, "close", None)
+                if callable(close):
+                    close()
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def _send_tile_rack_move_to_sender(self, sender, command: str) -> bool:  # type: ignore[no-untyped-def]
+        for method_name in ("send_commands", "send_command", "send", "write"):
+            method = getattr(sender, method_name, None)
+            if not callable(method):
+                continue
+            payloads = ([command], command) if method_name == "send_commands" else (command, [command])
+            for payload in payloads:
+                try:
+                    method(payload)
+                    return True
+                except TypeError:
+                    continue
+        return False
+
+    def _tile_rack_move_serial_config(self) -> SerialConfig:
+        import dataclasses
+        import inspect
+
+        for method_name in (
+            "_serial_config_from_form",
+            "_serial_config_from_inputs",
+            "_get_serial_config",
+            "serial_config_from_form",
+            "get_serial_config",
+        ):
+            method = getattr(self, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                config = method()
+            except Exception:
+                continue
+            if isinstance(config, SerialConfig):
+                return config
+
+        if dataclasses.is_dataclass(SerialConfig):
+            field_names = [field.name for field in dataclasses.fields(SerialConfig)]
+        else:
+            signature = inspect.signature(SerialConfig)
+            field_names = [name for name in signature.parameters if name != "self"]
+
+        values = {}
+        for name in field_names:
+            value = self._tile_rack_move_serial_value(name)
+            if value is not None:
+                values[name] = value
+        return SerialConfig(**values)
+
+    def _tile_rack_move_serial_value(self, name: str):  # type: ignore[no-untyped-def]
+        key = name.lower()
+        if key in {"port", "serial_port", "com_port"}:
+            return self._tile_rack_selected_port()
+        if key in {"baud", "baudrate", "baud_rate"}:
+            return int(self._tile_rack_read_gui_value("baud_var", "baudrate_var", "baud_rate_var", default="115200"))
+        if "timeout" in key:
+            return float(self._tile_rack_read_gui_value("timeout_var", "serial_timeout_var", default="2.0"))
+        if key in {"dry_run", "dryrun"}:
+            value = self._tile_rack_read_gui_value("dry_run_var", "dryrun_var", default=False)
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+        if "delay" in key or "settle" in key:
+            return float(self._tile_rack_read_gui_value("settle_seconds_var", "startup_delay_var", default="2.0"))
+        return None
+
+    def _tile_rack_move_config_has_port(self, config: SerialConfig) -> bool:
+        for name in ("port", "serial_port", "com_port"):
+            if hasattr(config, name):
+                value = getattr(config, name)
+                if value is not None and str(value).strip():
+                    return True
+        return False
+
+    def _tile_rack_selected_port(self) -> str | None:
+        port = self._tile_rack_read_gui_value(
+            "port_var",
+            "serial_port_var",
+            "com_port_var",
+            "plotter_port_var",
+            "selected_port_var",
+            "port_combo",
+            "serial_port_combo",
+            "com_port_combo",
+        )
+        if port is None:
+            return None
+        text = str(port).strip()
+        if not text:
+            return None
+        if text.upper().startswith("COM"):
+            return text.split()[0].rstrip(":,;")
+        if text.startswith("/dev/") or text.lower().startswith("usb"):
+            return text
+        for name, source in vars(self).items():
+            lowered = name.lower()
+            if "port" not in lowered and "com" not in lowered and "serial" not in lowered:
+                continue
+            if not hasattr(source, "get"):
+                continue
+            try:
+                value = source.get()
+            except Exception:
+                continue
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            if text.upper().startswith("COM"):
+                return text.split()[0].rstrip(":,;")
+            if text.startswith("/dev/") or text.lower().startswith("usb"):
+                return text
+        return text
+
+    def _tile_rack_read_gui_value(self, *names: str, default=None):  # type: ignore[no-untyped-def]
+        for name in names:
+            source = getattr(self, name, None)
+            if source is None:
+                continue
+            try:
+                value = source.get() if hasattr(source, "get") else source
+            except Exception:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return value
+        return default
+
+    def open_tile_rack_position_window(self, force_open: bool = False) -> None:
+        self._ensure_tile_rack_move_state()
+        existing_window = getattr(self, "_tile_rack_position_window", None)
+        if existing_window is not None and existing_window.winfo_exists():
+            existing_window.lift()
+            existing_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._tile_rack_position_window = window
+        window.title("Tile Rack Position")
+        window.resizable(False, False)
+        window.columnconfigure(1, weight=1)
+
+        ttk.Label(window, text="TR1 X").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        ttk.Entry(window, textvariable=self.tile_rack_tr1_x_var, width=12).grid(
+            row=0, column=1, sticky="ew", padx=10, pady=(10, 4)
+        )
+
+        ttk.Label(window, text="TR1 Y").grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(window, textvariable=self.tile_rack_tr1_y_var, width=12).grid(
+            row=1, column=1, sticky="ew", padx=10, pady=4
+        )
+
+        ttk.Label(window, text="Tile size").grid(row=2, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(window, textvariable=self.tile_rack_tile_size_var, width=12).grid(
+            row=2, column=1, sticky="ew", padx=10, pady=4
+        )
+
+        ttk.Label(window, text="Feed rate").grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(window, textvariable=self.tile_rack_feed_var, width=12).grid(
+            row=3, column=1, sticky="ew", padx=10, pady=4
+        )
+
+        buttons = ttk.LabelFrame(window, text="Rack Slots")
+        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 4))
+        for index in range(7):
+            target = f"TR{index + 1}"
+            ttk.Button(
+                buttons,
+                text=target,
+                command=lambda target=target: self._move_to_tile_rack_target_from_button(target),
+                width=5,
+            ).grid(row=index // 4, column=index % 4, sticky="ew", padx=2, pady=2)
+
+        ttk.Label(window, textvariable=self.tile_rack_status_var, wraplength=280).grid(
+            row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10)
+        )
+        return
+
+        self._ensure_tile_rack_position_state()
+        if not force_open and not getattr(self, "_tile_rack_manual_corners", None):
+            self.select_tile_rack_corners(open_position_after=True)
+            return
+
+        existing_window = getattr(self, "_tile_rack_position_window", None)
+        if existing_window is not None and existing_window.winfo_exists():
+            existing_window.lift()
+            existing_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._tile_rack_position_window = window
+        window.title("Tile Rack Position")
+        window.resizable(False, False)
+        window.columnconfigure(1, weight=1)
+
+        ttk.Label(window, text="Rack X").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        ttk.Entry(window, textvariable=self.tile_rack_position_x_var, width=12).grid(
+            row=0, column=1, sticky="ew", padx=10, pady=(10, 4)
+        )
+
+        ttk.Label(window, text="Rack Y").grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(window, textvariable=self.tile_rack_position_y_var, width=12).grid(
+            row=1, column=1, sticky="ew", padx=10, pady=4
+        )
+
+        ttk.Label(window, text="Slot gap").grid(row=2, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(window, textvariable=self.tile_rack_position_gap_var, width=12).grid(
+            row=2, column=1, sticky="ew", padx=10, pady=4
+        )
+
+        ttk.Label(window, text="Feed rate").grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(window, textvariable=self.tile_rack_position_feed_var, width=12).grid(
+            row=3, column=1, sticky="ew", padx=10, pady=4
+        )
+
+        ttk.Button(window, text="Move To Tile Rack", command=self.move_to_tile_rack_position).grid(
+            row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 4)
+        )
+        tr_frame = ttk.LabelFrame(window, text="Rack Positions")
+        tr_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        self._build_tile_rack_move_buttons(tr_frame)
+
+        ttk.Button(window, text="Detect Rack Letters", command=self.detect_tile_rack_position_letters).grid(
+            row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=4
+        )
+        ttk.Button(window, text="Select Rack Corners", command=self.select_tile_rack_corners).grid(
+            row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=4
+        )
+        rack_ocr_frame = ttk.LabelFrame(window, text="Tile Rack OCR")
+        rack_ocr_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        self._build_tile_rack_ocr_grid(rack_ocr_frame)
+
+        ttk.Label(window, textvariable=self.tile_rack_position_status_var, wraplength=300).grid(
+            row=9, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10)
+        )
+
+    def _ensure_tile_rack_position_state(self) -> None:
+        if getattr(self, "_tile_rack_position_state_ready", False):
+            return
+
+        default_feed = "1500"
+        feed_var = getattr(self, "feed_rate_var", None)
+        if feed_var is not None:
+            try:
+                default_feed = str(feed_var.get())
+            except Exception:
+                default_feed = "1500"
+
+        self.tile_rack_position_x_var = tk.StringVar(value="335")
+        self.tile_rack_position_y_var = tk.StringVar(value="30")
+        self.tile_rack_position_gap_var = tk.StringVar(value="10")
+        self.tile_rack_position_feed_var = tk.StringVar(value=default_feed)
+        self.tile_rack_position_status_var = tk.StringVar(value="Set the tile rack X/Y position, then move to it.")
+        self.tile_rack_ocr_letter_vars = [tk.StringVar(value="") for _ in range(7)]
+        self._tile_rack_manual_corners = getattr(self, "_tile_rack_manual_corners", None)
+        self._tile_rack_position_state_ready = True
+
+    def _build_tile_rack_move_buttons(self, parent) -> None:  # type: ignore[no-untyped-def]
+        for index in range(7):
+            target = f"TR{index + 1}"
+            ttk.Button(
+                parent,
+                text=target,
+                command=lambda target=target: self._move_to_tile_rack_label(target),
+                width=5,
+            ).grid(row=index // 4, column=index % 4, sticky="ew", padx=2, pady=2)
+
+    def _move_to_tile_rack_label(self, target: str) -> None:
+        try:
+            self._send_move_target(target)
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _build_tile_rack_ocr_grid(self, parent) -> None:  # type: ignore[no-untyped-def]
+        self._ensure_tile_rack_position_state()
+        for index, variable in enumerate(self.tile_rack_ocr_letter_vars):
+            ttk.Label(parent, text=f"TR{index + 1}").grid(row=index, column=0, sticky="e", padx=(6, 4), pady=1)
+            entry = ttk.Entry(parent, textvariable=variable, width=4, justify="center")
+            entry.grid(row=index, column=1, sticky="w", padx=(0, 6), pady=1)
+            entry.configure(state="readonly")
+
+    def move_to_tile_rack_position(self) -> None:
+        self._ensure_tile_rack_position_state()
+        try:
+            x = float(self.tile_rack_position_x_var.get())
+            y = float(self.tile_rack_position_y_var.get())
+            feed = float(self.tile_rack_position_feed_var.get())
+            command = self._send_absolute_plotter_move(x, y, feed)
+            message = f"Moved to tile rack position X{x:g} Y{y:g}."
+            self.tile_rack_position_status_var.set(message)
+            self._set_status(message)
+            self._log(command)
+        except Exception as exc:
+            self._show_error(exc)
+
+    def detect_tile_rack_position_letters(self) -> None:
+        import time
+
+        self._ensure_tile_rack_position_state()
+        try:
+            rack_x = float(self.tile_rack_position_x_var.get())
+            rack_y = float(self.tile_rack_position_y_var.get())
+            slot_gap = float(self.tile_rack_position_gap_var.get())
+            lines = []
+            detected_count = 0
+            for variable in self.tile_rack_ocr_letter_vars:
+                variable.set("")
+            for index in range(7):
+                slot_x = rack_x
+                slot_y = rack_y + slot_gap * index
+                self._set_status(f"Scanning tile rack slot {index + 1} at X{slot_x:g} Y{slot_y:g}...")
+                self._send_absolute_plotter_move(slot_x, slot_y, float(self.tile_rack_position_feed_var.get()))
+                time.sleep(0.8)
+                frame, _quality = self._capture_best_photo_for_ocr(f"tile rack slot {index + 1}")
+                scan = scan_camera_letters(frame)
+                letter = self._tile_rack_position_single_letter_from_scan(scan)
+                self.tile_rack_ocr_letter_vars[index].set("" if letter == "-" else letter)
+                if letter != "-":
+                    detected_count += 1
+                lines.append(f"Slot {index + 1}: {letter}  X{slot_x:g} Y{slot_y:g}")
+
+            result = "\n".join(lines)
+            self.tile_rack_position_status_var.set(result)
+            self._set_status(f"Detected {detected_count} tile rack letter(s) separately.")
+            self._log("Tile rack letters:\n" + result)
+            self._refresh_camera_preview()
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _tile_rack_position_single_letter_from_scan(self, scan: CameraLetterScanResult) -> str:
+        letters = self._tile_rack_position_letters_from_scan(scan)
+        return letters[0] if letters else "-"
+
+    def _tile_rack_position_letters_from_scan(self, scan: CameraLetterScanResult) -> list[str]:
+        letters: list[str] = []
+        for captured in sorted(self._tile_rack_scan_items(scan), key=self._tile_rack_position_letter_sort_key):
+            text = self._tile_rack_item_text(captured)
+            for character in str(text).upper():
+                if character.isalpha():
+                    letters.append(character)
+                    if len(letters) >= 7:
+                        return letters
+        return letters
+
+    def _tile_rack_scan_items(self, scan) -> list[object]:  # type: ignore[no-untyped-def]
+        items: list[object] = []
+        for name in ("letters", "tiles", "text_boxes"):
+            values = getattr(scan, name, None)
+            if values:
+                items.extend(list(values))
+        return items
+
+    def _tile_rack_item_text(self, item) -> str:  # type: ignore[no-untyped-def]
+        for name in ("text", "letter"):
+            value = getattr(item, name, None)
+            if value:
+                return str(value)
+        return ""
+
+    def _tile_rack_position_letter_sort_key(self, captured) -> tuple[float, float]:  # type: ignore[no-untyped-def]
+        center = self._tile_rack_position_letter_center(captured)
+        if center is None:
+            return (0.0, 0.0)
+        return (center[1], center[0])
+
+    def _tile_rack_position_letter_center(self, captured) -> tuple[float, float] | None:  # type: ignore[no-untyped-def]
+        center_x = getattr(captured, "center_x", None)
+        center_y = getattr(captured, "center_y", None)
+        if center_x is not None and center_y is not None:
+            return (float(center_x), float(center_y))
+
+        left = getattr(captured, "left", None)
+        top = getattr(captured, "top", None)
+        if left is not None and top is not None:
+            width = getattr(captured, "width", 0) or 0
+            height = getattr(captured, "height", 0) or 0
+            return (float(left) + float(width) / 2.0, float(top) + float(height) / 2.0)
+
+        points = getattr(captured, "points", None) or getattr(captured, "corners", None)
+        if points:
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+            return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+        return None
+
+    def select_tile_rack_corners(self, open_position_after: bool = False) -> None:
+        self._ensure_tile_rack_position_state()
+        try:
+            from PIL import Image, ImageTk
+
+            frame = self._current_camera_ocr_frame()
+            if frame is None:
+                frame, _quality = self._capture_best_photo_for_ocr("tile rack corner selection")
+        except Exception as exc:
+            self._show_error(exc)
+            return
+
+        try:
+            cv2 = _require_cv2()
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if len(frame.shape) == 3 else frame
+            image = Image.fromarray(rgb)
+        except Exception as exc:
+            self._show_error(exc)
+            return
+
+        max_width = 760
+        max_height = 520
+        scale = min(max_width / image.width, max_height / image.height, 1.0)
+        display_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+        display_image = image.resize(display_size)
+
+        window = tk.Toplevel(self.root)
+        window.title("Select Tile Rack Corners")
+        ttk.Label(window, text="Click the four tile rack corners: top-left, top-right, bottom-right, bottom-left.").grid(
+            row=0, column=0, sticky="ew", padx=10, pady=(10, 4)
+        )
+        canvas = tk.Canvas(window, width=display_size[0], height=display_size[1], cursor="crosshair")
+        canvas.grid(row=1, column=0, padx=10, pady=4)
+        photo = ImageTk.PhotoImage(display_image)
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas.image = photo
+
+        clicked: list[tuple[float, float]] = []
+
+        def redraw_points() -> None:
+            canvas.delete("corner")
+            for index, point in enumerate(clicked):
+                x = point[0] * scale
+                y = point[1] * scale
+                canvas.create_oval(x - 5, y - 5, x + 5, y + 5, outline="lime", width=2, tags="corner")
+                canvas.create_text(x + 12, y - 10, text=str(index + 1), fill="lime", tags="corner")
+            if len(clicked) > 1:
+                scaled = [(point[0] * scale, point[1] * scale) for point in clicked]
+                for start, end in zip(scaled, scaled[1:]):
+                    canvas.create_line(start[0], start[1], end[0], end[1], fill="lime", width=2, tags="corner")
+                if len(clicked) == 4:
+                    canvas.create_line(scaled[-1][0], scaled[-1][1], scaled[0][0], scaled[0][1], fill="lime", width=2, tags="corner")
+
+        def handle_click(event) -> None:  # type: ignore[no-untyped-def]
+            if len(clicked) >= 4:
+                return
+            clicked.append((float(event.x) / scale, float(event.y) / scale))
+            redraw_points()
+            if len(clicked) == 4:
+                self._tile_rack_manual_corners = clicked.copy()
+                self._last_tile_rack_camera_rect = None
+                self.tile_rack_position_status_var.set("Tile rack corners selected. The green rack grid will use these corners.")
+                self._set_status("Tile rack corners selected.")
+                self._refresh_camera_preview()
+                if open_position_after:
+                    window.after(400, lambda: (window.destroy(), self.open_tile_rack_position_window(force_open=True)))
+                else:
+                    window.after(400, window.destroy)
+
+        def clear_points() -> None:
+            clicked.clear()
+            self._tile_rack_manual_corners = None
+            self._last_tile_rack_camera_rect = None
+            canvas.delete("corner")
+            self.tile_rack_position_status_var.set("Tile rack corner selection cleared.")
+            self._refresh_camera_preview()
+
+        canvas.bind("<Button-1>", handle_click)
+        ttk.Button(window, text="Clear Rack Corners", command=clear_points).grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 10))
+
+    def _update_tile_rack_ocr_from_current_frame(self, scan: CameraLetterScanResult) -> None:
+        if not getattr(self, "_tile_rack_position_state_ready", False):
+            return
+        frame = self._current_camera_ocr_frame()
+        if frame is None:
+            return
+        letters = self._tile_rack_letters_from_brown_grid(frame, scan)
+        self._set_tile_rack_ocr_letters(letters)
+
+    def _set_tile_rack_ocr_letters(self, letters: list[str]) -> None:
+        self._ensure_tile_rack_position_state()
+        for index in range(7):
+            letter = letters[index] if index < len(letters) and letters[index] else ""
+            self.tile_rack_ocr_letter_vars[index].set(letter)
+
+    def _clear_tile_rack_ocr_letters(self) -> None:
+        self._ensure_tile_rack_position_state()
+        for variable in self.tile_rack_ocr_letter_vars:
+            variable.set("")
+
+    def detect_tile_rack_position_letters(self) -> None:
+        self._ensure_tile_rack_position_state()
+        try:
+            if self._captured_photo_frame is None:
+                frame, quality = self._capture_best_photo_for_ocr("tile rack OCR grid")
+                source = f"best camera frame, sharpness {quality.sharpness:.0f}"
+            else:
+                frame = self._captured_photo_frame.copy()
+                source = "captured picture"
+
+            scan = scan_camera_letters(frame)
+            letters = self._tile_rack_letters_from_brown_grid(frame, scan)
+            self._clear_tile_rack_ocr_letters()
+            self._set_tile_rack_ocr_letters(letters)
+            rack_x = float(self.tile_rack_position_x_var.get())
+            rack_y = float(self.tile_rack_position_y_var.get())
+            slot_gap = float(self.tile_rack_position_gap_var.get())
+            lines = []
+            detected_count = 0
+            for index in range(7):
+                letter = letters[index] if index < len(letters) and letters[index] else "-"
+                if letter != "-":
+                    detected_count += 1
+                slot_x = rack_x
+                slot_y = rack_y + slot_gap * index
+                lines.append(f"TR{index + 1}: {letter}  X{slot_x:g} Y{slot_y:g}")
+
+            result = "\n".join(lines)
+            self.tile_rack_position_status_var.set(result)
+            self._set_status(f"Detected {detected_count} tile rack letter(s) from the {source}.")
+            self._log("Tile rack OCR grid:\n" + result)
+            self._refresh_camera_preview()
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _tile_rack_letters_from_brown_grid(self, frame, scan: CameraLetterScanResult) -> list[str]:  # type: ignore[no-untyped-def]
+        manual_corners = getattr(self, "_tile_rack_manual_corners", None)
+        if manual_corners and len(manual_corners) == 4:
+            return self._tile_rack_letters_from_corner_grid(manual_corners, scan)
+
+        rect = self._detect_tile_rack_brown_rect(frame)
+        letters = [""] * 7
+        self._last_tile_rack_camera_rect = rect
+        if rect is None:
+            fallback_letters = self._tile_rack_position_letters_from_scan(scan)
+            for index, letter in enumerate(fallback_letters[:7]):
+                letters[index] = letter
+            return letters
+
+        for captured in self._tile_rack_scan_items(scan):
+            center = self._tile_rack_position_letter_center(captured)
+            if center is None:
+                continue
+            slot_index = self._tile_rack_slot_index_from_point(rect, center[0], center[1])
+            if slot_index is None or letters[slot_index]:
+                continue
+            text = self._tile_rack_item_text(captured)
+            for character in str(text).upper():
+                if character.isalpha():
+                    letters[slot_index] = character
+                    break
+        return letters
+
+    def _tile_rack_letters_from_corner_grid(self, corners, scan: CameraLetterScanResult) -> list[str]:  # type: ignore[no-untyped-def]
+        letters = [""] * 7
+        for captured in self._tile_rack_scan_items(scan):
+            center = self._tile_rack_position_letter_center(captured)
+            if center is None:
+                continue
+            slot_index = self._tile_rack_slot_index_from_corner_grid(corners, center[0], center[1])
+            if slot_index is None or letters[slot_index]:
+                continue
+            text = self._tile_rack_item_text(captured)
+            for character in str(text).upper():
+                if character.isalpha():
+                    letters[slot_index] = character
+                    break
+        return letters
+
+    def _tile_rack_slot_index_from_corner_grid(self, corners, x: float, y: float) -> int | None:  # type: ignore[no-untyped-def]
+        cv2 = _require_cv2()
+        import numpy as np
+
+        source = np.array(corners, dtype=np.float32)
+        destination = np.array([(0.0, 0.0), (1.0, 0.0), (1.0, 7.0), (0.0, 7.0)], dtype=np.float32)
+        transform = cv2.getPerspectiveTransform(source, destination)
+        point = np.array([[[float(x), float(y)]]], dtype=np.float32)
+        mapped = cv2.perspectiveTransform(point, transform)[0][0]
+        grid_x = float(mapped[0])
+        grid_y = float(mapped[1])
+        if grid_x < -0.05 or grid_x > 1.05 or grid_y < -0.05 or grid_y > 7.05:
+            return None
+        return max(0, min(6, int(grid_y)))
+
+    def _detect_tile_rack_brown_rect(self, frame):  # type: ignore[no-untyped-def]
+        cv2 = _require_cv2()
+        import numpy as np
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) if len(frame.shape) == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        if len(frame.shape) != 3:
+            hsv = cv2.cvtColor(hsv, cv2.COLOR_BGR2HSV)
+
+        lower_brown = np.array([5, 35, 25], dtype=np.uint8)
+        upper_brown = np.array([35, 255, 210], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_brown, upper_brown)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        frame_area = float(frame.shape[0] * frame.shape[1])
+        best_rect = None
+        best_score = 0.0
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            area = float(width * height)
+            if area < frame_area * 0.002:
+                continue
+            if height < width * 1.4:
+                continue
+            score = area * (height / max(width, 1))
+            if score > best_score:
+                best_rect = (int(x), int(y), int(width), int(height))
+                best_score = score
+        return best_rect
+
+    def _tile_rack_slot_index_from_point(self, rect, x: float, y: float) -> int | None:  # type: ignore[no-untyped-def]
+        rect_x, rect_y, rect_width, rect_height = rect
+        if x < rect_x or x > rect_x + rect_width or y < rect_y or y > rect_y + rect_height:
+            return None
+        slot_height = rect_height / 7.0
+        if slot_height <= 0:
+            return None
+        return max(0, min(6, int((y - rect_y) / slot_height)))
+
+    def _draw_tile_rack_green_grid_overlay(self, frame):  # type: ignore[no-untyped-def]
+        cv2 = _require_cv2()
+        manual_corners = getattr(self, "_tile_rack_manual_corners", None)
+        if manual_corners and len(manual_corners) == 4:
+            return self._draw_tile_rack_corner_grid_overlay(frame, manual_corners)
+
+        rect = getattr(self, "_last_tile_rack_camera_rect", None) or self._detect_tile_rack_brown_rect(frame)
+        if rect is None:
+            return frame
+
+        x, y, width, height = rect
+        green = (0, 255, 0)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x, y), (x + width, y + height), green, 3, cv2.LINE_AA)
+        for index in range(1, 7):
+            line_y = int(round(y + height * index / 7.0))
+            cv2.line(overlay, (x, line_y), (x + width, line_y), green, 2, cv2.LINE_AA)
+
+        for index in range(7):
+            center_y = int(round(y + height * (index + 0.5) / 7.0))
+            letter = ""
+            if getattr(self, "_tile_rack_position_state_ready", False):
+                letter = self.tile_rack_ocr_letter_vars[index].get()
+            if letter:
+                cv2.putText(
+                    overlay,
+                    letter,
+                    (x + max(8, width // 2 - 10), center_y + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    green,
+                    2,
+                    cv2.LINE_AA,
+                )
+        return overlay
+
+    def _draw_tile_rack_corner_grid_overlay(self, frame, corners):  # type: ignore[no-untyped-def]
+        cv2 = _require_cv2()
+        import numpy as np
+
+        overlay = frame.copy()
+        green = (0, 255, 0)
+        source = np.array([(0.0, 0.0), (1.0, 0.0), (1.0, 7.0), (0.0, 7.0)], dtype=np.float32)
+        destination = np.array(corners, dtype=np.float32)
+        transform = cv2.getPerspectiveTransform(source, destination)
+
+        def project(point):  # type: ignore[no-untyped-def]
+            mapped = cv2.perspectiveTransform(np.array([[point]], dtype=np.float32), transform)[0][0]
+            return int(round(float(mapped[0]))), int(round(float(mapped[1])))
+
+        outline = [project(point) for point in [(0.0, 0.0), (1.0, 0.0), (1.0, 7.0), (0.0, 7.0)]]
+        for index, point in enumerate(outline):
+            cv2.line(overlay, point, outline[(index + 1) % 4], green, 3, cv2.LINE_AA)
+
+        for index in range(1, 7):
+            left = project((0.0, float(index)))
+            right = project((1.0, float(index)))
+            cv2.line(overlay, left, right, green, 2, cv2.LINE_AA)
+
+        for index in range(7):
+            letter_point = project((0.48, index + 0.5))
+            if getattr(self, "_tile_rack_position_state_ready", False):
+                letter = self.tile_rack_ocr_letter_vars[index].get()
+                if letter:
+                    cv2.putText(overlay, letter, letter_point, cv2.FONT_HERSHEY_SIMPLEX, 0.9, green, 2, cv2.LINE_AA)
+        return overlay
+
+    def _send_tile_rack_position_command(self, command: str) -> None:
+        self._send_plotter_raw_command(command)
+        return
+
+        sender = getattr(self, "_send_tile_rack_command", None)
+        if callable(sender):
+            sender(command, prefer_arduino=False)
+            return
+
+        for method_name in (
+            "_send_raw_command",
+            "_send_manual_command",
+            "_send_command",
+            "_send_gcode_command",
+            "send_raw_command",
+            "send_manual_command",
+            "send_command",
+            "send_gcode_command",
+        ):
+            method = getattr(self, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method(command)
+                return
+            except TypeError:
+                continue
+
+        raise RuntimeError("Could not find the plotter command sender for the tile rack position.")
+
     def open_tile_rack_window(self) -> None:
+        raise_user_error("The tile rack feature has been removed.")
+        return
+
         self._ensure_tile_rack_state()
         existing_window = getattr(self, "_tile_rack_window", None)
         if existing_window is not None and existing_window.winfo_exists():
@@ -643,36 +1645,31 @@ class ScrabblePlotterApp:
         for column in range(6):
             motion_frame.columnconfigure(column, weight=1)
 
-        ttk.Label(motion_frame, text="X").grid(row=0, column=0, sticky="w", padx=6, pady=(8, 2))
+        ttk.Label(motion_frame, text="Left rack X").grid(row=0, column=0, sticky="w", padx=6, pady=(8, 2))
         ttk.Entry(motion_frame, textvariable=self.tile_rack_x_var, width=8).grid(row=0, column=1, padx=6, pady=(8, 2))
-        ttk.Label(motion_frame, text="Y").grid(row=0, column=2, sticky="w", padx=6, pady=(8, 2))
+        ttk.Label(motion_frame, text="Top Y").grid(row=0, column=2, sticky="w", padx=6, pady=(8, 2))
         ttk.Entry(motion_frame, textvariable=self.tile_rack_y_var, width=8).grid(row=0, column=3, padx=6, pady=(8, 2))
-        ttk.Label(motion_frame, text="Spacing").grid(row=0, column=4, sticky="w", padx=6, pady=(8, 2))
+        ttk.Label(motion_frame, text="Vertical gap").grid(row=0, column=4, sticky="w", padx=6, pady=(8, 2))
         ttk.Entry(motion_frame, textvariable=self.tile_rack_spacing_var, width=8).grid(row=0, column=5, padx=6, pady=(8, 2))
 
-        ttk.Label(motion_frame, text="Safe Z").grid(row=1, column=0, sticky="w", padx=6, pady=2)
-        ttk.Entry(motion_frame, textvariable=self.tile_rack_safe_z_var, width=8).grid(row=1, column=1, padx=6, pady=2)
-        ttk.Label(motion_frame, text="Pick Z").grid(row=1, column=2, sticky="w", padx=6, pady=2)
-        ttk.Entry(motion_frame, textvariable=self.tile_rack_pick_z_var, width=8).grid(row=1, column=3, padx=6, pady=2)
-        ttk.Label(motion_frame, text="Place Z").grid(row=1, column=4, sticky="w", padx=6, pady=2)
-        ttk.Entry(motion_frame, textvariable=self.tile_rack_place_z_var, width=8).grid(row=1, column=5, padx=6, pady=2)
+        ttk.Label(motion_frame, text="MG995").grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        ttk.Label(motion_frame, text="Automatic lift/lower").grid(row=1, column=1, columnspan=3, sticky="w", padx=6, pady=2)
+        ttk.Label(motion_frame, text="Servo wait").grid(row=1, column=4, sticky="w", padx=6, pady=2)
+        ttk.Label(motion_frame, text=f"{DEFAULT_MG995_SERVO_WAIT_SECONDS:g}s").grid(row=1, column=5, sticky="w", padx=6, pady=2)
 
         ttk.Label(motion_frame, text="XY feed").grid(row=2, column=0, sticky="w", padx=6, pady=2)
         ttk.Entry(motion_frame, textvariable=self.tile_rack_xy_feed_var, width=8).grid(row=2, column=1, padx=6, pady=2)
-        ttk.Label(motion_frame, text="Z feed").grid(row=2, column=2, sticky="w", padx=6, pady=2)
-        ttk.Entry(motion_frame, textvariable=self.tile_rack_z_feed_var, width=8).grid(row=2, column=3, padx=6, pady=2)
+        ttk.Label(motion_frame, text="Arduino").grid(row=2, column=2, sticky="w", padx=6, pady=2)
+        ttk.Label(motion_frame, text="Uses selected controller port").grid(row=2, column=3, sticky="w", padx=6, pady=2)
         ttk.Button(motion_frame, text="Go To Rack", command=self.move_to_tile_rack_start).grid(
             row=2, column=4, columnspan=2, sticky="ew", padx=6, pady=2
         )
 
-        ttk.Label(motion_frame, text="Magnet on").grid(row=3, column=0, sticky="w", padx=6, pady=(2, 8))
-        ttk.Entry(motion_frame, textvariable=self.tile_rack_magnet_on_var, width=10).grid(
-            row=3, column=1, padx=6, pady=(2, 8)
-        )
-        ttk.Label(motion_frame, text="Magnet off").grid(row=3, column=2, sticky="w", padx=6, pady=(2, 8))
-        ttk.Entry(motion_frame, textvariable=self.tile_rack_magnet_off_var, width=10).grid(
-            row=3, column=3, padx=6, pady=(2, 8)
-        )
+        ttk.Label(motion_frame, text="Move wait").grid(row=3, column=0, sticky="w", padx=6, pady=2)
+        ttk.Label(motion_frame, text=f"{DEFAULT_TILE_RACK_MOVE_WAIT_SECONDS:g}s").grid(row=3, column=1, sticky="w", padx=6, pady=2)
+
+        ttk.Label(motion_frame, text="Magnet").grid(row=4, column=0, sticky="w", padx=6, pady=(2, 8))
+        ttk.Label(motion_frame, text="Automatic on/off").grid(row=4, column=1, columnspan=3, sticky="w", padx=6, pady=(2, 8))
 
         self.tile_rack_make_button = ttk.Button(
             window,
@@ -701,15 +1698,16 @@ class ScrabblePlotterApp:
 
         self.tile_rack_letters_var = tk.StringVar(value="")
         self.tile_rack_word_var = tk.StringVar(value="")
-        self.tile_rack_start_square_var = tk.StringVar(value="F6")
+        self.tile_rack_start_square_var = tk.StringVar(value="G6")
         self.tile_rack_x_var = tk.StringVar(value="0")
-        self.tile_rack_y_var = tk.StringVar(value="0")
+        self.tile_rack_y_var = tk.StringVar(value="40")
         self.tile_rack_spacing_var = tk.StringVar(value="25")
-        self.tile_rack_safe_z_var = tk.StringVar(value="20")
-        self.tile_rack_pick_z_var = tk.StringVar(value="0")
-        self.tile_rack_place_z_var = tk.StringVar(value="0")
         self.tile_rack_xy_feed_var = tk.StringVar(value=default_feed)
-        self.tile_rack_z_feed_var = tk.StringVar(value="600")
+        self.tile_rack_servo_up_var = tk.StringVar(value="SERVO_UP")
+        self.tile_rack_servo_down_var = tk.StringVar(value="SERVO_DOWN")
+        self.tile_rack_servo_wait_var = tk.StringVar(value="0.4")
+        self.tile_rack_move_wait_var = tk.StringVar(value="1.0")
+        self.tile_rack_arduino_port_var = tk.StringVar(value="")
         self.tile_rack_magnet_on_var = tk.StringVar(value="M3")
         self.tile_rack_magnet_off_var = tk.StringVar(value="M5")
         self.tile_rack_status_var = tk.StringVar(
@@ -772,26 +1770,61 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self.root.after(0, lambda exc=exc: self._show_error(exc))
             return
-        self.root.after(0, lambda: self._handle_tile_rack_scan_result(scan))
+        frame_shape = getattr(frame, "shape", None)
+        frame_width = int(frame_shape[1]) if frame_shape is not None and len(frame_shape) >= 2 else 0
+        self.root.after(0, lambda scan=scan, frame_width=frame_width: self._handle_tile_rack_scan_result(scan, frame_width))
 
-    def _handle_tile_rack_scan_result(self, scan: CameraLetterScanResult) -> None:
-        rack_letters = self._rack_letters_from_camera_scan(scan)
+    def _handle_tile_rack_scan_result(self, scan: CameraLetterScanResult, frame_width: int = 0) -> None:
+        rack_letters = self._rack_letters_from_camera_scan(scan, frame_width)
         self.tile_rack_letters_var.set(rack_letters)
         if rack_letters:
-            message = f"Tile rack captured {len(rack_letters)} letter(s): {rack_letters}"
+            message = f"Left-side vertical tile rack captured {len(rack_letters)} letter(s): {rack_letters}"
         else:
-            message = "No rack letters were detected. Type the rack letters or capture a clearer rack image."
+            message = "No left-side rack letters were detected. Type the rack letters or capture a clearer rack image."
         self._set_tile_rack_status(message)
         self._refresh_camera_preview()
 
-    def _rack_letters_from_camera_scan(self, scan: CameraLetterScanResult) -> str:
+    def _rack_letters_from_camera_scan(self, scan: CameraLetterScanResult, frame_width: int = 0) -> str:
+        rack_letters = self._filter_left_side_rack_letters(scan, frame_width)
         detected = []
-        for captured in sorted(scan.letters, key=self._camera_letter_sort_key):
+        for captured in sorted(rack_letters, key=self._camera_letter_vertical_sort_key):
             text = getattr(captured, "text", "")
             detected.extend(character for character in str(text).upper() if character.isalpha())
         return normalize_rack_letters("".join(detected))
 
-    def _camera_letter_sort_key(self, captured) -> tuple[float, float]:  # type: ignore[no-untyped-def]
+    def _filter_left_side_rack_letters(self, scan: CameraLetterScanResult, frame_width: int) -> list[object]:
+        letters = list(scan.letters)
+        if not letters:
+            return []
+
+        board_left = None
+        if scan.grid is not None and getattr(scan.grid, "corners", None):
+            board_left = min(float(point[0]) for point in scan.grid.corners)
+        else:
+            calibration = getattr(self, "_calibration", None)
+            image_corners = getattr(calibration, "image_corners", None)
+            if image_corners and len(image_corners) == 4:
+                board_left = min(float(point[0]) for point in image_corners)
+
+        filtered = []
+        for captured in letters:
+            center = self._camera_letter_center(captured)
+            if center is None:
+                continue
+            x, _ = center
+            if board_left is not None:
+                if x < board_left:
+                    filtered.append(captured)
+            elif frame_width > 0 and x <= frame_width * 0.40:
+                filtered.append(captured)
+
+        if filtered:
+            return filtered[:7]
+        if board_left is not None or frame_width > 0:
+            return []
+        return letters[:7]
+
+    def _camera_letter_center(self, captured) -> tuple[float, float] | None:  # type: ignore[no-untyped-def]
         center_x = getattr(captured, "center_x", None)
         center_y = getattr(captured, "center_y", None)
         if center_x is not None and center_y is not None:
@@ -799,17 +1832,35 @@ class ScrabblePlotterApp:
         left = getattr(captured, "left", None)
         top = getattr(captured, "top", None)
         if left is not None and top is not None:
-            return (float(left), float(top))
+            width = getattr(captured, "width", 0) or 0
+            height = getattr(captured, "height", 0) or 0
+            return (float(left) + float(width) / 2.0, float(top) + float(height) / 2.0)
         points = getattr(captured, "points", None) or getattr(captured, "corners", None)
         if points:
             xs = [float(point[0]) for point in points]
             ys = [float(point[1]) for point in points]
-            return (min(xs), min(ys))
-        return (0.0, 0.0)
+            return (sum(xs) / len(xs), sum(ys) / len(ys))
+        return None
+
+    def _camera_letter_vertical_sort_key(self, captured) -> tuple[float, float]:  # type: ignore[no-untyped-def]
+        center = self._camera_letter_center(captured)
+        if center is None:
+            return (0.0, 0.0)
+        return (center[1], center[0])
 
     def suggest_tile_rack_word(self) -> None:
         self._ensure_tile_rack_state()
         rack_letters = normalize_rack_letters(self.tile_rack_letters_var.get())
+        word = self._best_tile_rack_word(rack_letters)
+        if not word:
+            self._set_tile_rack_status(
+                "No playable word was found in the loaded word list. Enter a word manually to check it."
+            )
+            return
+        self.tile_rack_word_var.set(word)
+        self._set_tile_rack_status(f"Suggested word: {word}")
+
+    def _best_tile_rack_word(self, rack_letters: str) -> str:
         candidates = self._tile_rack_word_candidates()
         playable = [
             normalize_word(candidate)
@@ -817,13 +1868,7 @@ class ScrabblePlotterApp:
             if can_build_word_from_rack(str(candidate), rack_letters)
         ]
         playable = sorted({word for word in playable if word}, key=lambda word: (-len(word), word))
-        if not playable:
-            self._set_tile_rack_status(
-                "No playable word was found in the loaded word list. Enter a word manually to check it."
-            )
-            return
-        self.tile_rack_word_var.set(playable[0])
-        self._set_tile_rack_status(f"Suggested word: {playable[0]}")
+        return playable[0] if playable else ""
 
     def _tile_rack_word_candidates(self) -> list[str]:
         candidates: list[str] = []
@@ -866,12 +1911,12 @@ class ScrabblePlotterApp:
         squares: list[str] = []
         if can_make:
             try:
-                squares = horizontal_word_squares(self.tile_rack_start_square_var.get(), word)
+                squares = horizontal_word_squares(self.tile_rack_start_square_var.get(), word, direction="left")
             except Exception as exc:
                 placement_error = exc
         button = getattr(self, "tile_rack_make_button", None)
         if button is not None:
-            button.configure(state="normal" if can_make and placement_error is None else "disabled")
+            button.configure(state="normal")
         if show_status:
             if can_make and placement_error is None:
                 self._set_tile_rack_status(f"{word} can be made and will be placed at {' '.join(squares)}.")
@@ -888,27 +1933,49 @@ class ScrabblePlotterApp:
         self._ensure_tile_rack_state()
         try:
             rack_letters = normalize_rack_letters(self.tile_rack_letters_var.get())
+            if not rack_letters:
+                rack_letters = self._capture_tile_rack_letters_for_placement()
             word = normalize_word(self.tile_rack_word_var.get())
+            if not word:
+                word = self._best_tile_rack_word(rack_letters)
+                if word:
+                    self.tile_rack_word_var.set(word)
             if not can_build_word_from_rack(word, rack_letters):
                 raise ValueError(f"{word or 'That word'} cannot be made from rack letters {rack_letters}.")
             slot_indices = rack_slot_indices_for_word(word, rack_letters)
-            target_squares = horizontal_word_squares(self.tile_rack_start_square_var.get(), word)
+            target_squares = horizontal_word_squares(self.tile_rack_start_square_var.get(), word, direction="left")
             settings = self._tile_rack_motion_settings()
             self._place_tile_rack_word(word, slot_indices, target_squares, settings)
         except Exception as exc:
             self._show_error(exc)
 
+    def _capture_tile_rack_letters_for_placement(self) -> str:
+        if self._captured_photo_frame is None:
+            frame, _quality = self._capture_best_photo_for_ocr("tile rack placement")
+        else:
+            frame = self._captured_photo_frame.copy()
+
+        scan = scan_camera_letters(frame)
+        frame_shape = getattr(frame, "shape", None)
+        frame_width = int(frame_shape[1]) if frame_shape is not None and len(frame_shape) >= 2 else 0
+        rack_letters = self._rack_letters_from_camera_scan(scan, frame_width)
+        self.tile_rack_letters_var.set(rack_letters)
+        if not rack_letters:
+            raise ValueError("No left-side rack letters were detected for placement.")
+        self._set_tile_rack_status(f"Detected rack letters for placement: {rack_letters}")
+        return rack_letters
+
     def move_to_tile_rack_start(self) -> None:
         self._ensure_tile_rack_state()
         try:
             settings = self._tile_rack_motion_settings()
-            self._send_tile_rack_z_move(float(settings["safe_z"]), float(settings["z_feed"]))
+            self._send_tile_rack_servo_up(settings)
             self._send_tile_rack_xy_move(
                 float(settings["rack_x"]),
                 float(settings["rack_y"]),
                 float(settings["xy_feed"]),
             )
-            self._set_tile_rack_status("Plotter moved to tile rack slot 1.")
+            self._set_tile_rack_status("Plotter moved to tile rack slot 1 with the magnet lifted.")
         except Exception as exc:
             self._show_error(exc)
 
@@ -917,13 +1984,14 @@ class ScrabblePlotterApp:
             "rack_x": float(self.tile_rack_x_var.get()),
             "rack_y": float(self.tile_rack_y_var.get()),
             "slot_spacing": float(self.tile_rack_spacing_var.get()),
-            "safe_z": float(self.tile_rack_safe_z_var.get()),
-            "pick_z": float(self.tile_rack_pick_z_var.get()),
-            "place_z": float(self.tile_rack_place_z_var.get()),
             "xy_feed": float(self.tile_rack_xy_feed_var.get()),
-            "z_feed": float(self.tile_rack_z_feed_var.get()),
-            "magnet_on": self.tile_rack_magnet_on_var.get().strip(),
-            "magnet_off": self.tile_rack_magnet_off_var.get().strip(),
+            "servo_up_commands": MG995_SERVO_UP_COMMANDS,
+            "servo_down_commands": MG995_SERVO_DOWN_COMMANDS,
+            "servo_wait": DEFAULT_MG995_SERVO_WAIT_SECONDS,
+            "move_wait": DEFAULT_TILE_RACK_MOVE_WAIT_SECONDS,
+            "arduino_port": "",
+            "magnet_on_commands": MAGNET_ON_COMMANDS,
+            "magnet_off_commands": MAGNET_OFF_COMMANDS,
         }
 
     def _place_tile_rack_word(
@@ -933,78 +2001,564 @@ class ScrabblePlotterApp:
         target_squares: list[str],
         settings: dict[str, float | str],
     ) -> None:
-        self._set_tile_rack_status(f"Placing {word} from the tile rack...")
-        self._log(f"Tile rack placement started for {word}.")
-        self._send_tile_rack_z_move(float(settings["safe_z"]), float(settings["z_feed"]))
+        with self._tile_rack_serial_session():
+            self._set_tile_rack_status(f"Placing {word} from the tile rack...")
+            self._log(f"Tile rack placement started for {word}.")
+            self._send_tile_rack_servo_up(settings)
+            self._send_tile_rack_magnet_off(settings)
 
-        for letter, slot_index, target_square in zip(word, slot_indices, target_squares):
-            rack_x = float(settings["rack_x"]) + slot_index * float(settings["slot_spacing"])
-            rack_y = float(settings["rack_y"])
+            for letter, slot_index, target_square in zip(word, slot_indices, target_squares):
+                rack_x, rack_y = vertical_rack_slot_position(
+                    float(settings["rack_x"]),
+                    float(settings["rack_y"]),
+                    slot_index,
+                    float(settings["slot_spacing"]),
+                )
 
-            self._log(f"Picking {letter} from rack slot {slot_index + 1}.")
-            self._send_tile_rack_xy_move(rack_x, rack_y, float(settings["xy_feed"]))
-            self._send_tile_rack_z_move(float(settings["pick_z"]), float(settings["z_feed"]))
-            self._send_tile_rack_command(str(settings["magnet_on"]))
-            self._send_tile_rack_command("G4 P0.2")
-            self._send_tile_rack_z_move(float(settings["safe_z"]), float(settings["z_feed"]))
+                self._log(f"Picking {letter} from rack slot {slot_index + 1}.")
+                self._send_tile_rack_servo_up(settings)
+                self._send_tile_rack_xy_move(rack_x, rack_y, float(settings["xy_feed"]))
+                self._wait_after_tile_rack_move(settings)
+                self._send_tile_rack_servo_down(settings)
+                self._send_tile_rack_magnet_on(settings)
+                self._send_tile_rack_delay(settings)
+                self._send_tile_rack_servo_up(settings)
 
-            self._log(f"Placing {letter} on {target_square}.")
-            self._send_square_move(target_square)
-            self._send_tile_rack_z_move(float(settings["place_z"]), float(settings["z_feed"]))
-            self._send_tile_rack_command(str(settings["magnet_off"]))
-            self._send_tile_rack_command("G4 P0.2")
-            self._send_tile_rack_z_move(float(settings["safe_z"]), float(settings["z_feed"]))
+                self._log(f"Placing {letter} on {target_square}.")
+                self._send_tile_rack_square_move(target_square, settings)
+                self._wait_after_tile_rack_move(settings)
+                self._send_tile_rack_servo_down(settings)
+                self._send_tile_rack_magnet_off(settings)
+                self._send_tile_rack_delay(settings)
+                self._send_tile_rack_servo_up(settings)
 
-        self._set_tile_rack_status(f"Placed {word} horizontally from {target_squares[0]}.")
-        self._log(f"Tile rack placement complete for {word}: {' '.join(target_squares)}.")
+            self._set_tile_rack_status(f"Placed {word} right-to-left from {target_squares[0]}.")
+            self._log(f"Tile rack placement complete for {word}: {' '.join(target_squares)}.")
 
     def _send_tile_rack_xy_move(self, x: float, y: float, feed: float) -> None:
-        self._send_tile_rack_command(f"G0 X{x:g} Y{y:g} F{feed:g}")
+        self._send_tile_rack_command(f"G0 X{x:g} Y{y:g} F{feed:g}", prefer_arduino=False)
+
+    def _send_tile_rack_square_move(self, square: str, settings: dict[str, float | str]) -> None:
+        command = self._tile_rack_square_move_command(square, float(settings["xy_feed"]))
+        if command:
+            self._send_tile_rack_command(command, prefer_arduino=False)
+            return
+        self._send_square_move(square)
+
+    def _tile_rack_square_move_command(self, square: str, feed: float) -> str:
+        calibration = None
+        for method_name in ("_calibration_from_form", "_calibration"):
+            source = getattr(self, method_name, None)
+            try:
+                calibration = source() if callable(source) else source
+            except Exception:
+                calibration = None
+            if calibration is not None:
+                break
+
+        if calibration is not None:
+            for args in (
+                (calibration, square, feed),
+                (square, calibration, feed),
+                (calibration, square),
+                (square, calibration),
+            ):
+                try:
+                    command = format_move_command(*args)
+                    if command:
+                        return str(command)
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+
+            for method_name in (
+                "square_center",
+                "center_for_square",
+                "coordinates_for_square",
+                "square_to_xy",
+                "xy_for_square",
+                "square_center_mm",
+                "plotter_coordinates_for_square",
+                "square_to_plotter_xy",
+                "board_square_to_plotter_position",
+            ):
+                method = getattr(calibration, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    x, y = method(square)
+                except Exception:
+                    continue
+                for args in ((x, y, feed), (x, y), (float(x), float(y), feed)):
+                    try:
+                        command = format_move_command(*args)
+                        if command:
+                            return str(command)
+                    except TypeError:
+                        continue
+                    except Exception:
+                        continue
+                return f"G0 X{float(x):g} Y{float(y):g} F{feed:g}"
+        return ""
 
     def _send_tile_rack_z_move(self, z: float, feed: float) -> None:
-        self._send_tile_rack_command(f"G0 Z{z:g} F{feed:g}")
+        self._send_tile_rack_command(f"G0 Z{z:g} F{feed:g}", prefer_arduino=False)
 
-    def _send_tile_rack_command(self, command: str) -> None:
+    def _send_tile_rack_servo_up(self, settings: dict[str, float | str]) -> None:
+        self._send_tile_rack_aux_command_sequence(settings["servo_up_commands"])
+        self._send_tile_rack_delay(settings)
+
+    def _send_tile_rack_servo_down(self, settings: dict[str, float | str]) -> None:
+        self._send_tile_rack_aux_command_sequence(settings["servo_down_commands"])
+        self._send_tile_rack_delay(settings)
+
+    def _send_tile_rack_magnet_on(self, settings: dict[str, float | str]) -> None:
+        self._send_tile_rack_aux_command_sequence(settings["magnet_on_commands"])
+
+    def _send_tile_rack_magnet_off(self, settings: dict[str, float | str]) -> None:
+        self._send_tile_rack_aux_command_sequence(settings["magnet_off_commands"])
+
+    def _send_tile_rack_delay(self, settings: dict[str, float | str]) -> None:
+        import time
+
+        wait_seconds = max(0.0, float(settings["servo_wait"]))
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _wait_after_tile_rack_move(self, settings: dict[str, float | str]) -> None:
+        import time
+
+        wait_seconds = max(0.0, float(settings["move_wait"]))
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _send_tile_rack_aux_command(self, command: str) -> None:
+        self._send_tile_rack_command(command, prefer_arduino=False)
+
+    def _send_tile_rack_aux_command_sequence(self, commands) -> None:  # type: ignore[no-untyped-def]
+        last_error: Exception | None = None
+        sent_any = False
+        for command in commands:
+            try:
+                self._send_tile_rack_aux_command(str(command))
+                sent_any = True
+            except Exception as exc:
+                last_error = exc
+        if not sent_any and last_error is not None:
+            raise last_error
+
+    def _tile_rack_serial_session(self):  # type: ignore[no-untyped-def]
+        import contextlib
+
+        return contextlib.nullcontext()
+
+        if getattr(self, "_tile_rack_active_sender", None) is not None:
+            return contextlib.nullcontext()
+
+        try:
+            config = self._tile_rack_serial_config(prefer_arduino=False)
+        except Exception:
+            return contextlib.nullcontext()
+        if not self._serial_config_has_port(config, prefer_arduino=False):
+            return contextlib.nullcontext()
+
+        try:
+            sender = GCodeSender(config)
+        except TypeError:
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def session():
+            active_sender = sender
+            aux_sender = None
+            active_aux_sender = None
+            entered = False
+            aux_entered = False
+            try:
+                if hasattr(sender, "__enter__") and hasattr(sender, "__exit__"):
+                    active_sender = sender.__enter__()
+                    entered = True
+                self._tile_rack_active_sender = active_sender
+                plotter_port = self._serial_config_port(config)
+                aux_port = self._selected_tile_rack_serial_port(prefer_arduino=True)
+                if aux_port and aux_port != plotter_port:
+                    aux_config = self._tile_rack_serial_config(prefer_arduino=True)
+                    aux_sender = GCodeSender(aux_config)
+                    active_aux_sender = aux_sender
+                    if hasattr(aux_sender, "__enter__") and hasattr(aux_sender, "__exit__"):
+                        active_aux_sender = aux_sender.__enter__()
+                        aux_entered = True
+                    self._tile_rack_active_aux_sender = active_aux_sender
+                else:
+                    self._tile_rack_active_aux_sender = active_sender
+                yield
+            finally:
+                self._tile_rack_active_sender = None
+                self._tile_rack_active_aux_sender = None
+                if aux_sender is not None:
+                    if aux_entered:
+                        aux_sender.__exit__(None, None, None)
+                    else:
+                        close = getattr(aux_sender, "close", None)
+                        if callable(close):
+                            close()
+                if entered:
+                    sender.__exit__(None, None, None)
+                else:
+                    close = getattr(sender, "close", None)
+                    if callable(close):
+                        close()
+
+        return session()
+
+    def _send_tile_rack_command(self, command: str, prefer_arduino: bool = False) -> None:
         command = command.strip()
         if not command:
             return
 
+        active_sender = (
+            getattr(self, "_tile_rack_active_aux_sender", None)
+            if prefer_arduino
+            else getattr(self, "_tile_rack_active_sender", None)
+        )
+        if active_sender is not None:
+            if self._send_tile_rack_command_with_gcode_sender(command, prefer_arduino=prefer_arduino):
+                return
+            raise RuntimeError(f"Could not send tile rack command: {command}")
+
+        if prefer_arduino and self._tile_rack_arduino_port():
+            if self._send_tile_rack_command_with_gcode_sender(command, prefer_arduino=True):
+                return
+            raise RuntimeError("Could not send the tile rack MG995/magnet command to the Arduino port.")
+
         for method_name in (
+            "_send_commands",
+            "_send_serial_commands",
+            "_send_controller_commands",
+            "_send_gcode_commands",
+            "send_commands",
+            "send_serial_commands",
+            "send_controller_commands",
+            "send_gcode_commands",
             "_send_raw_command",
             "_send_manual_command",
             "_send_command",
             "_send_gcode_command",
+            "send_raw_command",
+            "send_manual_command",
+            "send_command",
+            "send_gcode_command",
         ):
             method = getattr(self, method_name, None)
             if callable(method):
-                try:
-                    method(command)
+                if self._try_tile_rack_sender_method(method, command, prefer_list="commands" in method_name):
                     return
-                except TypeError:
-                    pass
 
-        sender = getattr(self, "_sender", None) or getattr(self, "sender", None)
+        sender = (
+            getattr(self, "_sender", None)
+            or getattr(self, "sender", None)
+            or getattr(self, "_gcode_sender", None)
+            or getattr(self, "gcode_sender", None)
+        )
         if sender is not None:
-            for method_name in ("send_command", "send", "write"):
+            for method_name in ("send_commands", "send_command", "send", "write"):
                 method = getattr(sender, method_name, None)
                 if callable(method):
-                    try:
-                        method(command)
+                    if self._try_tile_rack_sender_method(method, command, prefer_list="commands" in method_name):
                         return
-                    except TypeError:
-                        pass
-            send_commands = getattr(sender, "send_commands", None)
-            if callable(send_commands):
-                try:
-                    send_commands([command])
-                    return
-                except TypeError:
-                    pass
+
+        if self._send_tile_rack_command_with_gcode_sender(command, prefer_arduino=prefer_arduino):
+            return
+
+        if not self._selected_tile_rack_serial_port(prefer_arduino=prefer_arduino):
+            raise RuntimeError("Select the plotter COM port before using the tile rack movement.")
 
         raise RuntimeError(
             "No raw G-code sender was found for rack Z or magnet commands. "
             "Add a manual command sender or connect this method to the controller command path."
         )
+
+    def _try_tile_rack_sender_method(self, method, command: str, prefer_list: bool = False) -> bool:  # type: ignore[no-untyped-def]
+        list_payloads = (
+            ([command],),
+            ([command], "tile rack"),
+            ([command], "Tile rack command"),
+        )
+        string_payloads = (
+            (command,),
+            (command, "tile rack"),
+            (command, "Tile rack command"),
+        )
+        payloads = list_payloads + string_payloads if prefer_list else string_payloads + list_payloads
+        for payload in payloads:
+            try:
+                method(*payload)
+                return True
+            except TypeError:
+                continue
+        return False
+
+    def _send_tile_rack_command_with_gcode_sender(self, command: str, prefer_arduino: bool = False) -> bool:
+        active_sender = (
+            getattr(self, "_tile_rack_active_aux_sender", None)
+            if prefer_arduino
+            else getattr(self, "_tile_rack_active_sender", None)
+        )
+        if active_sender is not None:
+            return self._send_tile_rack_command_to_sender(active_sender, command)
+
+        try:
+            config = self._tile_rack_serial_config(prefer_arduino=prefer_arduino)
+        except Exception:
+            return False
+        if not self._serial_config_has_port(config, prefer_arduino=prefer_arduino):
+            return False
+
+        try:
+            sender = GCodeSender(config)
+        except TypeError:
+            return False
+
+        context_sender = sender
+        if hasattr(sender, "__enter__") and hasattr(sender, "__exit__"):
+            with sender as active_sender:
+                context_sender = active_sender
+                return self._send_tile_rack_command_to_sender(context_sender, command)
+        return self._send_tile_rack_command_to_sender(context_sender, command)
+
+    def _send_tile_rack_command_to_sender(self, sender, command: str) -> bool:  # type: ignore[no-untyped-def]
+        for method_name in ("send_commands", "send_command", "send", "write"):
+            method = getattr(sender, method_name, None)
+            if callable(method) and self._try_tile_rack_sender_method(method, command, prefer_list="commands" in method_name):
+                return True
+        return False
+
+    def _tile_rack_serial_config(self, prefer_arduino: bool = False) -> SerialConfig:
+        import dataclasses
+        import inspect
+
+        for method_name in (
+            "_serial_config_from_form",
+            "_serial_config_from_inputs",
+            "_serial_config",
+            "_get_serial_config",
+            "serial_config_from_form",
+            "get_serial_config",
+        ):
+            method = getattr(self, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                config = method()
+            except Exception:
+                continue
+            if isinstance(config, SerialConfig):
+                return self._tile_rack_config_with_selected_port(config, prefer_arduino=prefer_arduino)
+
+        names = []
+        if dataclasses.is_dataclass(SerialConfig):
+            names = [field.name for field in dataclasses.fields(SerialConfig)]
+        else:
+            signature = inspect.signature(SerialConfig)
+            names = [name for name in signature.parameters if name != "self"]
+
+        values = {}
+        for name in names:
+            value = self._tile_rack_serial_config_value(name, prefer_arduino=prefer_arduino)
+            if value is not None:
+                values[name] = value
+        return self._tile_rack_config_with_selected_port(SerialConfig(**values), prefer_arduino=prefer_arduino)
+
+    def _tile_rack_config_with_selected_port(self, config: SerialConfig, prefer_arduino: bool = False) -> SerialConfig:
+        import dataclasses
+
+        selected_port = self._selected_tile_rack_serial_port(prefer_arduino=prefer_arduino)
+        if not selected_port:
+            return config
+
+        for name in ("port", "serial_port", "com_port"):
+            if not hasattr(config, name):
+                continue
+            current = getattr(config, name)
+            if current is not None and str(current).strip() and not prefer_arduino:
+                return config
+            if dataclasses.is_dataclass(config):
+                return dataclasses.replace(config, **{name: selected_port})
+            try:
+                setattr(config, name, selected_port)
+            except Exception:
+                return config
+            return config
+        return config
+
+    def _serial_config_has_port(self, config: SerialConfig, prefer_arduino: bool = False) -> bool:
+        for name in ("port", "serial_port", "com_port"):
+            if hasattr(config, name):
+                value = getattr(config, name)
+                if value is not None and str(value).strip():
+                    return True
+        return bool(self._selected_tile_rack_serial_port(prefer_arduino=prefer_arduino))
+
+    def _serial_config_port(self, config: SerialConfig) -> str | None:
+        for name in ("port", "serial_port", "com_port"):
+            if hasattr(config, name):
+                value = getattr(config, name)
+                if value is not None and str(value).strip():
+                    return self._normalize_serial_port_name(value)
+        return None
+
+    def _tile_rack_serial_config_value(self, name: str, prefer_arduino: bool = False):  # type: ignore[no-untyped-def]
+        key = name.lower()
+        if key in {"port", "serial_port", "com_port"}:
+            return self._selected_tile_rack_serial_port(prefer_arduino=prefer_arduino) or self._read_tile_rack_gui_value(
+                "port_var",
+                "serial_port_var",
+                "com_port_var",
+                "plotter_port_var",
+                "selected_port_var",
+            )
+        if key in {"baud", "baudrate", "baud_rate"}:
+            return int(
+                self._read_tile_rack_gui_value(
+                    "baud_var",
+                    "baudrate_var",
+                    "baud_rate_var",
+                    default="115200",
+                )
+            )
+        if key == "timeout" or "timeout" in key:
+            return float(self._read_tile_rack_gui_value("timeout_var", "serial_timeout_var", default="2.0"))
+        if key in {"dry_run", "dryrun"}:
+            value = self._read_tile_rack_gui_value("dry_run_var", "dryrun_var", default=False)
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+        if "settle" in key or "delay" in key:
+            return float(self._read_tile_rack_gui_value("settle_seconds_var", "startup_delay_var", default="2.0"))
+        return None
+
+    def _tile_rack_arduino_port(self) -> str | None:
+        source = getattr(self, "tile_rack_arduino_port_var", None)
+        if source is None:
+            source_value = None
+        else:
+            try:
+                source_value = source.get()
+            except Exception:
+                source_value = None
+        if self._looks_like_serial_port(source_value):
+            return self._normalize_serial_port_name(source_value)
+        return None
+
+    def _detect_tile_rack_mg995_port(self) -> str | None:
+        import time
+
+        try:
+            import serial
+        except Exception:
+            return None
+
+        try:
+            ports = list_serial_ports()
+        except Exception:
+            return None
+
+        port_names: list[str] = []
+        selected_plotter_port = self._selected_tile_rack_serial_port(prefer_arduino=False)
+        if selected_plotter_port:
+            port_names.append(selected_plotter_port)
+
+        for port in ports:
+            name = getattr(port, "device", None) or getattr(port, "name", None) or str(port)
+            normalized_name = self._normalize_serial_port_name(name)
+            if self._looks_like_serial_port(normalized_name) and normalized_name not in port_names:
+                port_names.append(normalized_name)
+
+        for port_name in port_names:
+            try:
+                with serial.Serial(port_name, 115200, timeout=0.35, write_timeout=0.35) as connection:
+                    time.sleep(1.8)
+                    connection.reset_input_buffer()
+                    connection.write(b"MG995_PING\n")
+                    connection.flush()
+                    deadline = time.monotonic() + 1.2
+                    response = ""
+                    while time.monotonic() < deadline:
+                        line = connection.readline().decode(errors="ignore")
+                        response += line
+                        if "SCRABBLE_MG995_A1_READY" in response or "MG995" in response:
+                            return port_name
+            except Exception:
+                continue
+        return None
+
+    def _selected_tile_rack_serial_port(self, prefer_arduino: bool = False) -> str | None:
+        if prefer_arduino:
+            arduino_port = self._tile_rack_arduino_port()
+            if arduino_port:
+                return arduino_port
+
+        port = self._read_tile_rack_gui_value(
+            "port_var",
+            "serial_port_var",
+            "com_port_var",
+            "plotter_port_var",
+            "selected_port_var",
+            "port_combo",
+            "serial_port_combo",
+            "com_port_combo",
+        )
+        if self._looks_like_serial_port(port):
+            return self._normalize_serial_port_name(port)
+
+        for name, source in vars(self).items():
+            lowered = name.lower()
+            if not prefer_arduino and "arduino" in lowered:
+                continue
+            if "port" not in lowered and "com" not in lowered and "serial" not in lowered:
+                continue
+            if not hasattr(source, "get"):
+                continue
+            try:
+                value = source.get()
+            except Exception:
+                continue
+            if self._looks_like_serial_port(value):
+                return self._normalize_serial_port_name(value)
+        return None
+
+    def _looks_like_serial_port(self, value) -> bool:  # type: ignore[no-untyped-def]
+        if value is None:
+            return False
+        text = str(value).strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        return lowered.startswith("com") or lowered.startswith("/dev/") or lowered.startswith("usb")
+
+    def _normalize_serial_port_name(self, value) -> str:  # type: ignore[no-untyped-def]
+        text = str(value).strip()
+        if text.upper().startswith("COM"):
+            token = text.split()[0].rstrip(":,;")
+            return token
+        return text
+
+    def _read_tile_rack_gui_value(self, *names: str, default=None):  # type: ignore[no-untyped-def]
+        for name in names:
+            source = getattr(self, name, None)
+            if source is None:
+                continue
+            try:
+                value = source.get() if hasattr(source, "get") else source
+            except Exception:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return value
+        return default
 
     def _set_tile_rack_status(self, message: str) -> None:
         if getattr(self, "_tile_rack_state_ready", False):
@@ -1497,6 +3051,14 @@ class ScrabblePlotterApp:
         return encoded.tobytes()
 
     def _send_square_move(self, square_label: str) -> None:
+        if getattr(self, "_force_z_up_before_pick_drop_move", False):
+            self._send_pick_drop_aux_command("ZU")
+
+        target = str(square_label).strip().upper()
+        if self._is_tile_rack_target(target):
+            self._send_tile_rack_target_move(target)
+            return
+
         calibration = self._calibration_from_form()
         calibration.validate_ready_for_move()
         square = parse_square_label(square_label)

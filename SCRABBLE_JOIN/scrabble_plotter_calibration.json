@@ -4,30 +4,30 @@
   "image_path": null,
   "image_corners": [
     [
-      130.0,
+      108.0,
       7.0
     ],
     [
-      572.0,
-      6.0
-    ],
-    [
       554.0,
-      427.0
+      2.0
     ],
     [
-      145.0,
-      426.0
+      550.0,
+      432.0
+    ],
+    [
+      125.0,
+      430.0
     ]
   ],
   "camera_index": 1,
-  "offset_x_mm": 130.0,
-  "offset_y_mm": 50.0,
+  "offset_x_mm": 150.0,
+  "offset_y_mm": 40.0,
   "cell_size_mm": 15.0,
   "x_steps_per_mm": 9.0,
   "y_steps_per_mm": 9.0,
   "cart_x_mm": 100.0,
-  "cart_y_mm": 80.0,
+  "cart_y_mm": 75.0,
   "premium_layout": [
     [
       "normal",
