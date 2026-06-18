@@ -27,7 +27,7 @@ from .scanner import (
     scan_camera_words,
     select_best_frame,
 )
-from .word_bank import format_words_by_direction, matched_matrix_words
+from .word_bank import format_words_by_direction, matched_matrix_words, normalize_word
 from .scoring import (
     ScoreResult,
     normalize_letter,
@@ -128,6 +128,7 @@ class ScrabblePlotterApp:
         self._last_camera_letter_scan: CameraLetterScanResult | None = None
         self._last_camera_word_scan: CameraWordScanResult | None = None
         self._camera_word_scan_running = False
+        self._pending_actuator_challenge_after_word_scan = False
         self.camera_words_text: tk.Text | None = None
 
         self.status_var = tk.StringVar(
@@ -476,6 +477,9 @@ class ScrabblePlotterApp:
             ("Prev Word", self.previous_actuator_word),
             ("Next Word", self.next_actuator_word),
             ("Send Word", self.send_actuator_word),
+            ("Camera Words", self.send_camera_words_to_actuator),
+            ("Light Letters", self.send_letter_leds_to_actuator),
+            ("LED Test", self.test_actuator_leds),
             ("Reveal Word", self.reveal_actuator_word),
             ("Clear LEDs", self.clear_actuator_leds),
             ("Display On", self.actuator_display_on),
@@ -4739,14 +4743,11 @@ class ScrabblePlotterApp:
         self.captured_letters_var.set(captured_text)
         self._lock_scan_to_manual_board_grid(scan)
         aligned_count = 0
-        if announce:
+        should_map_to_board = announce or self._pending_actuator_challenge_after_word_scan
+        if should_map_to_board:
             aligned_count = self._apply_camera_letter_scan_to_locked_board_grid(scan)
             if aligned_count == 0:
                 aligned_count = self._apply_camera_ocr_grid_to_board_form(scan.grid)
-        if announce:
-            self._clear_tile_rack_side_from_main_ocr_grid()
-        if announce:
-            self._clear_tile_rack_side_from_main_ocr_grid()
         if captured_text:
             message = f"Captured {len(scan.letters)} letter group(s): {captured_text}"
         else:
@@ -4792,7 +4793,8 @@ class ScrabblePlotterApp:
         self._last_camera_word_scan = scan
         self._lock_scan_to_manual_board_grid(scan)
         aligned_count = 0
-        if announce:
+        should_map_to_board = announce or self._pending_actuator_challenge_after_word_scan
+        if should_map_to_board:
             aligned_count = self._apply_camera_letter_scan_to_locked_board_grid(scan)
             if aligned_count == 0:
                 aligned_count = self._apply_camera_ocr_grid_to_board_form(scan.grid)
@@ -4818,6 +4820,10 @@ class ScrabblePlotterApp:
             message += " Board grid was not visible enough to align."
         self._set_status(message)
         self._refresh_camera_preview()
+        if announce:
+            self._try_send_camera_words_to_actuator()
+        if self._pending_actuator_challenge_after_word_scan:
+            self._finish_pending_actuator_challenge()
 
     def _handle_camera_word_scan_error(
         self,
@@ -4828,6 +4834,8 @@ class ScrabblePlotterApp:
         if scan_token is not None and scan_token != self._camera_word_scan_token:
             return
         self._camera_word_scan_running = False
+        if self._pending_actuator_challenge_after_word_scan:
+            self._pending_actuator_challenge_after_word_scan = False
         message = str(exc)
         if announce or self._last_live_word_scan_error != message:
             self._last_live_word_scan_error = message
@@ -5140,6 +5148,7 @@ class ScrabblePlotterApp:
         self._camera_word_scan_token += 1
         self._live_letter_scan_running = False
         self._camera_word_scan_running = False
+        self._pending_actuator_challenge_after_word_scan = False
 
     def _next_camera_letter_scan_token(self) -> int:
         self._camera_letter_scan_token += 1
@@ -5301,6 +5310,9 @@ class ScrabblePlotterApp:
         self._log(f"Sent actuator command: {command}")
         if responses:
             self._log("Actuator responses: " + " | ".join(responses))
+        for response in responses:
+            if response.lower().startswith("err"):
+                raise RuntimeError(f"Board Actuator Arduino error: {response}")
         return responses
 
     def test_actuator_connection(self) -> None:
@@ -5332,7 +5344,37 @@ class ScrabblePlotterApp:
         self._send_actuator_button_command("COUNTDOWN_STOP")
 
     def start_actuator_challenge(self) -> None:
-        self._send_actuator_button_command("CHALLENGE_START")
+        try:
+            if getattr(self, "_camera_word_scan_running", False):
+                self._pending_actuator_challenge_after_word_scan = True
+                self._set_status("Waiting for the current camera scan, then the challenge LEDs will update.")
+                return
+
+            try:
+                frame, quality = self._capture_best_photo_for_ocr("challenge")
+                source = f"best camera frame (sharpness {quality.sharpness:.0f})"
+            except RuntimeError as exc:
+                if str(exc) != "Start the camera first.":
+                    raise
+                self._send_actuator_challenge_from_current_grid()
+                return
+
+            confidence_threshold = self._ocr_confidence_threshold()
+            self._camera_word_scan_running = True
+            self._pending_actuator_challenge_after_word_scan = True
+            scan_token = self._next_camera_word_scan_token()
+            self._set_status(f"Reading the board from the {source} before starting challenge...")
+            self._set_camera_words_text("Finding challenge words...")
+            self._log(f"Challenge camera scan started from {source}.")
+            thread = threading.Thread(
+                target=self._camera_word_scan_worker,
+                args=(frame.copy(), confidence_threshold, False, scan_token),
+                daemon=True,
+            )
+            thread.start()
+        except Exception as exc:
+            self._pending_actuator_challenge_after_word_scan = False
+            self._show_error(exc)
 
     def cancel_actuator_challenge(self) -> None:
         self._send_actuator_button_command("CHALLENGE_CANCEL")
@@ -5352,8 +5394,29 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self._show_error(exc)
 
+    def send_camera_words_to_actuator(self) -> None:
+        try:
+            words = self._camera_challenge_words()
+            if not words:
+                raise ValueError("No camera words are available yet. Use Find Words first.")
+            self._send_camera_words_to_actuator(words)
+        except Exception as exc:
+            self._show_error(exc)
+
+    def send_letter_leds_to_actuator(self) -> None:
+        try:
+            self._send_led_cells_to_actuator(self._current_led_cell_labels(), announce=True)
+        except Exception as exc:
+            self._show_error(exc)
+
+    def test_actuator_leds(self) -> None:
+        self._send_actuator_button_command("LED_TEST")
+
     def reveal_actuator_word(self) -> None:
-        self._send_actuator_button_command("WORD_CHOOSE")
+        try:
+            self._send_actuator_command("WORD_CHOOSE")
+        except Exception as exc:
+            self._show_error(exc)
 
     def clear_actuator_leds(self) -> None:
         self._send_actuator_button_command("LED_CLEAR")
@@ -5363,6 +5426,98 @@ class ScrabblePlotterApp:
 
     def actuator_display_off(self) -> None:
         self._send_actuator_button_command("DISPLAY_OFF")
+
+    def _camera_challenge_words(self) -> list[str]:
+        words: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: object) -> None:
+            word = normalize_word(value)
+            if len(word) < 2 or word in seen:
+                return
+            seen.add(word)
+            words.append(word)
+
+        scan = self._last_camera_word_scan
+        if scan is not None:
+            for detected in scan.words:
+                add(detected.word)
+            if scan.grid is not None:
+                for detected in matched_matrix_words(scan.grid.board_letters()):
+                    add(detected.word)
+
+        return words[:10]
+
+    def _send_camera_words_to_actuator(self, words: list[str]) -> None:
+        command = "WORD_LIST " + ",".join(words)
+        self._send_actuator_command(command)
+        self._set_status(f"Sent {len(words)} camera word(s) to the board actuator challenge list.")
+
+    def _try_send_camera_words_to_actuator(self) -> None:
+        if not self.actuator_port_var.get().strip():
+            return
+        words = self._camera_challenge_words()
+        try:
+            if words:
+                self._send_camera_words_to_actuator(words)
+            else:
+                self._send_actuator_command("WORD_CLEAR")
+                self._log("Cleared board actuator challenge words because the camera found none.")
+        except Exception as exc:
+            self._log(f"Camera words were not sent to the board actuator: {exc}")
+
+    def _finish_pending_actuator_challenge(self) -> None:
+        self._pending_actuator_challenge_after_word_scan = False
+        try:
+            self._send_actuator_challenge_from_current_grid()
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _send_actuator_challenge_from_current_grid(self) -> None:
+        labels = self._current_led_cell_labels()
+        if not labels:
+            raise ValueError(
+                "No board letters were found for the challenge LEDs. Start the camera or run Find Words first."
+            )
+
+        words = self._camera_challenge_words()
+        if words:
+            self._send_camera_words_to_actuator(words)
+        self._send_actuator_command("CHALLENGE_START")
+        self._send_led_cells_to_actuator(labels, announce=False)
+        self._set_status(f"Challenge started with {len(labels)} red LED cell(s).")
+
+    def _current_led_cell_labels(self) -> list[str]:
+        labels: list[str] = []
+        for col in range(BOARD_SIZE):
+            for row in range(BOARD_SIZE):
+                letter = normalize_letter(self._letter_vars[row][col].get())
+                if letter:
+                    labels.append(f"{chr(ord('A') + col)}{row + 1}")
+        return labels
+
+    def _send_led_cells_to_actuator(self, labels: list[str], announce: bool = True) -> None:
+        if not labels:
+            self._send_actuator_command("LED_CLEAR")
+            if announce:
+                self._set_status("Sent letter lights to the board actuator (0 lit cell(s)).")
+            return
+
+        command = "LED_CELLS " + ",".join(labels)
+        if len(command) >= 180:
+            raise ValueError("Too many detected letter cells to send in one Arduino command.")
+        self._send_actuator_command(command)
+        if announce:
+            lit_count = len(labels)
+            self._set_status(f"Sent letter lights to the board actuator ({lit_count} lit cell(s)).")
+
+    def _try_send_letter_leds_to_actuator(self, announce: bool = False) -> None:
+        if not self.actuator_port_var.get().strip():
+            return
+        try:
+            self._send_led_cells_to_actuator(self._current_led_cell_labels(), announce=announce)
+        except Exception as exc:
+            self._log(f"Letter lights were not sent to the board actuator: {exc}")
 
     def _send_actuator_button_command(self, command: str) -> None:
         try:

@@ -4,18 +4,15 @@
 #include <string.h>
 
 // ================= DISPLAY =================
-// Page-buffer version saves RAM on Arduino Uno.
+// Page-buffer version saves RAM on Arduino Uno/Nano.
 U8G2_ST7920_128X64_1_SW_SPI u8g2(U8G2_R0, 13, 11, 10, U8X8_PIN_NONE);
 
 // ================= SERVO / ACTUATOR =================
-// All 4 servo signal wires are connected to pin 9.
 Servo actuatorServo;
 
 const byte SERVO_PIN = 9;
-
-const int SERVO_MIN_ANGLE = 20;   // board lowered
-const int SERVO_MAX_ANGLE = 160;  // board lifted
-
+const int SERVO_MIN_ANGLE = 20;
+const int SERVO_MAX_ANGLE = 160;
 const int SERVO_STEPS = 100;
 const unsigned long SERVO_STEP_DELAY_MS = 20;
 
@@ -23,9 +20,7 @@ int currentAngle = SERVO_MIN_ANGLE;
 int startAngle = SERVO_MIN_ANGLE;
 int targetAngle = SERVO_MIN_ANGLE;
 int servoStep = 0;
-
 unsigned long lastServoStepTime = 0;
-
 bool boardRaised = false;
 bool servoMoving = false;
 
@@ -33,7 +28,6 @@ void writeActuator(int angle) {
   actuatorServo.write(angle);
 }
 
-// Smooth movement without using cos() to save memory.
 int easedAngle(int startA, int targetA, int stepNo) {
   long i = constrain(stepNo, 0, SERVO_STEPS);
   long numerator = 3L * i * i * SERVO_STEPS - 2L * i * i * i;
@@ -58,7 +52,6 @@ void updateServoSystem() {
   if (now - lastServoStepTime >= SERVO_STEP_DELAY_MS) {
     lastServoStepTime = now;
     servoStep++;
-
     currentAngle = easedAngle(startAngle, targetAngle, servoStep);
     writeActuator(currentAngle);
 
@@ -71,7 +64,7 @@ void updateServoSystem() {
 }
 
 // ================= BUTTON PINS =================
-const byte BUTTON_TOGGLE = 2;     // power button
+const byte BUTTON_TOGGLE = 2;
 const byte BUTTON_COUNTDOWN = 3;
 const byte BUTTON_CHALLENGE = 4;
 const byte BUTTON_PREV = 5;
@@ -131,23 +124,20 @@ Button btnNext(BUTTON_NEXT);
 
 // ================= LED STRIP =================
 #define LED_PIN 12
-#define LED_COUNT 10
+#define LED_ROWS 12
+#define LED_COLS 12
+#define LED_COUNT (LED_ROWS * LED_COLS)
 
+// Physical LED order is serpentine by column:
+// A1-A12, then B12-B1, then C1-C12, then D12-D1, ... up to L.
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ================= WORDS =================
-const char* fallbackWords[] = {
-  "APPLE",
-  "BANANA",
-  "CHERRY",
-  "DATE",
-  "ELDERBERRY"
-};
-
-const int fallbackWordCount = sizeof(fallbackWords) / sizeof(fallbackWords[0]);
 int currentWordIndex = 0;
-char runtimeWord[18] = "";
-bool hasRuntimeWord = false;
+const byte MAX_RUNTIME_WORDS = 10;
+const byte MAX_WORD_LENGTH = 16;
+char runtimeWords[MAX_RUNTIME_WORDS][MAX_WORD_LENGTH + 1];
+byte runtimeWordCount = 0;
 
 // ================= STATES =================
 bool displayOn = false;
@@ -158,35 +148,27 @@ bool showCountdown = false;
 unsigned long countdownStart = 0;
 unsigned long countdownDurationMs = 30000;
 unsigned long wordChosenTime = 0;
-
 const unsigned long DISPLAY_REFRESH_TIME_MS = 80;
 unsigned long lastDisplayRefresh = 0;
 
 // ================= SERIAL =================
-char serialLine[80];
+char serialLine[200];
 byte serialLength = 0;
 
 // ================= WORD / LED FUNCTIONS =================
-const char* currentWord() {
-  if (hasRuntimeWord && runtimeWord[0] != '\0') {
-    return runtimeWord;
-  }
-  return fallbackWords[currentWordIndex];
+int activeWordCount() {
+  return runtimeWordCount;
 }
 
-void showWordLengthLEDs(const char* word) {
-  strip.clear();
-
-  int len = strlen(word);
-  if (len > LED_COUNT) {
-    len = LED_COUNT;
+const char* currentWord() {
+  int count = activeWordCount();
+  if (count <= 0) {
+    return "";
   }
-
-  for (int i = 0; i < len; i++) {
-    strip.setPixelColor(i, strip.Color(255, 0, 0));
+  if (currentWordIndex < 0 || currentWordIndex >= count) {
+    currentWordIndex = 0;
   }
-
-  strip.show();
+  return runtimeWords[currentWordIndex];
 }
 
 void clearLEDs() {
@@ -194,16 +176,163 @@ void clearLEDs() {
   strip.show();
 }
 
-void setRuntimeWord(const char* word) {
-  byte outputIndex = 0;
-  for (byte inputIndex = 0; word[inputIndex] != '\0' && outputIndex < sizeof(runtimeWord) - 1; inputIndex++) {
-    char c = word[inputIndex];
-    if (c >= 'A' && c <= 'Z') {
-      runtimeWord[outputIndex++] = c;
+int ledPixelIndex(byte row, byte col) {
+  if (row >= LED_ROWS || col >= LED_COLS) {
+    return -1;
+  }
+
+  if (col % 2 == 0) {
+    return col * LED_ROWS + row;
+  }
+  return col * LED_ROWS + (LED_ROWS - 1 - row);
+}
+
+void showLedTest() {
+  strip.clear();
+  int pixel = ledPixelIndex(0, 0);
+  if (pixel >= 0 && pixel < LED_COUNT) {
+    strip.setPixelColor(pixel, strip.Color(180, 0, 0));
+  }
+  strip.show();
+}
+
+bool parseLedCellToken(const char* token, byte* row, byte* col) {
+  if (token[0] < 'A' || token[0] > 'L') {
+    return false;
+  }
+
+  char* endPtr = NULL;
+  long parsedRow = strtol(token + 1, &endPtr, 10);
+  if (endPtr == token + 1 || *endPtr != '\0' || parsedRow < 1 || parsedRow > LED_ROWS) {
+    return false;
+  }
+
+  *col = (byte)(token[0] - 'A');
+  *row = (byte)(parsedRow - 1);
+  return true;
+}
+
+bool showLedCells(char* payload, int* litCount) {
+  strip.clear();
+  *litCount = 0;
+
+  char* tokenStart = payload;
+  for (char* cursor = payload; ; cursor++) {
+    bool atEnd = *cursor == '\0';
+    bool separator = *cursor == ',' || *cursor == ';' || *cursor == ' ' || *cursor == '\t';
+
+    if (atEnd || separator) {
+      char saved = *cursor;
+      *cursor = '\0';
+
+      if (tokenStart[0] != '\0') {
+        byte row = 0;
+        byte col = 0;
+        if (!parseLedCellToken(tokenStart, &row, &col)) {
+          strip.clear();
+          strip.show();
+          return false;
+        }
+
+        int pixel = ledPixelIndex(row, col);
+        if (pixel >= 0 && pixel < LED_COUNT) {
+          strip.setPixelColor(pixel, strip.Color(180, 0, 0));
+          (*litCount)++;
+        }
+      }
+
+      if (atEnd) {
+        break;
+      }
+      *cursor = saved;
+      tokenStart = cursor + 1;
     }
   }
-  runtimeWord[outputIndex] = '\0';
-  hasRuntimeWord = runtimeWord[0] != '\0';
+
+  strip.show();
+  return true;
+}
+
+bool copyCleanWord(char* destination, const char* word) {
+  byte outputIndex = 0;
+  for (byte inputIndex = 0; word[inputIndex] != '\0' && outputIndex < MAX_WORD_LENGTH; inputIndex++) {
+    char c = word[inputIndex];
+    if (c >= 'A' && c <= 'Z') {
+      destination[outputIndex++] = c;
+    }
+  }
+  destination[outputIndex] = '\0';
+  return outputIndex > 0;
+}
+
+void clearRuntimeWords() {
+  runtimeWordCount = 0;
+  currentWordIndex = 0;
+  for (byte index = 0; index < MAX_RUNTIME_WORDS; index++) {
+    runtimeWords[index][0] = '\0';
+  }
+}
+
+bool runtimeWordExists(const char* word) {
+  for (byte index = 0; index < runtimeWordCount; index++) {
+    if (strcmp(runtimeWords[index], word) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool appendRuntimeWord(const char* word) {
+  if (runtimeWordCount >= MAX_RUNTIME_WORDS) {
+    return false;
+  }
+
+  char cleaned[MAX_WORD_LENGTH + 1];
+  if (!copyCleanWord(cleaned, word) || runtimeWordExists(cleaned)) {
+    return false;
+  }
+
+  strcpy(runtimeWords[runtimeWordCount], cleaned);
+  runtimeWordCount++;
+  return true;
+}
+
+bool setRuntimeWord(const char* word) {
+  char cleaned[MAX_WORD_LENGTH + 1];
+  if (!copyCleanWord(cleaned, word)) {
+    return false;
+  }
+
+  clearRuntimeWords();
+  strcpy(runtimeWords[0], cleaned);
+  runtimeWordCount = 1;
+  return true;
+}
+
+bool setRuntimeWordList(char* words) {
+  clearRuntimeWords();
+
+  char* tokenStart = words;
+  for (char* cursor = words; ; cursor++) {
+    bool atEnd = *cursor == '\0';
+    bool separator = *cursor == ',' || *cursor == ';' || *cursor == '|' || *cursor == ' ' || *cursor == '\t';
+
+    if (atEnd || separator) {
+      char saved = *cursor;
+      *cursor = '\0';
+      appendRuntimeWord(tokenStart);
+
+      if (atEnd || runtimeWordCount >= MAX_RUNTIME_WORDS) {
+        break;
+      }
+
+      *cursor = saved;
+      tokenStart = cursor + 1;
+    }
+  }
+
+  currentWordIndex = 0;
+  return runtimeWordCount > 0;
 }
 
 // ================= SHARED ACTIONS =================
@@ -266,13 +395,19 @@ void cancelChallengeMode() {
 }
 
 void previousWord() {
-  hasRuntimeWord = false;
-  currentWordIndex = (currentWordIndex - 1 + fallbackWordCount) % fallbackWordCount;
+  int count = activeWordCount();
+  if (count <= 0) {
+    return;
+  }
+  currentWordIndex = (currentWordIndex - 1 + count) % count;
 }
 
 void nextWord() {
-  hasRuntimeWord = false;
-  currentWordIndex = (currentWordIndex + 1) % fallbackWordCount;
+  int count = activeWordCount();
+  if (count <= 0) {
+    return;
+  }
+  currentWordIndex = (currentWordIndex + 1) % count;
 }
 
 void chooseCurrentWord() {
@@ -281,7 +416,6 @@ void chooseCurrentWord() {
   inChallengeMode = true;
   showCountdown = false;
   wordChosenTime = millis();
-  showWordLengthLEDs(currentWord());
 }
 
 void displayOff() {
@@ -381,6 +515,8 @@ void printStatus() {
   Serial.print(wordChosen ? 1 : 0);
   Serial.print(F(" countdown="));
   Serial.print(showCountdown ? 1 : 0);
+  Serial.print(F(" word_count="));
+  Serial.print(activeWordCount());
   Serial.print(F(" word="));
   Serial.println(currentWord());
 }
@@ -427,10 +563,25 @@ void handleSerialCommand(char* rawCommand) {
   } else if (strcmp(cmd, "CHALLENGE_CANCEL") == 0) {
     cancelChallengeMode();
     Serial.println(F("ok challenge cancel"));
+  } else if (strcmp(cmd, "WORD_CLEAR") == 0) {
+    clearRuntimeWords();
+    clearLEDs();
+    Serial.println(F("ok word clear"));
+  } else if (commandStartsWith(cmd, "WORD_LIST")) {
+    char* wordsText = trimWhitespace(cmd + strlen("WORD_LIST"));
+    if (!setRuntimeWordList(wordsText)) {
+      Serial.println(F("err invalid word list"));
+      return;
+    }
+    displayOn = true;
+    inChallengeMode = true;
+    wordChosen = false;
+    showCountdown = false;
+    Serial.print(F("ok word list "));
+    Serial.println(runtimeWordCount);
   } else if (commandStartsWith(cmd, "WORD_SET")) {
     char* wordText = trimWhitespace(cmd + strlen("WORD_SET"));
-    setRuntimeWord(wordText);
-    if (!hasRuntimeWord) {
+    if (!setRuntimeWord(wordText)) {
       Serial.println(F("err invalid word"));
       return;
     }
@@ -438,7 +589,6 @@ void handleSerialCommand(char* rawCommand) {
     inChallengeMode = true;
     wordChosen = false;
     showCountdown = false;
-    clearLEDs();
     Serial.print(F("ok word set "));
     Serial.println(currentWord());
   } else if (strcmp(cmd, "WORD_PREV") == 0) {
@@ -456,6 +606,18 @@ void handleSerialCommand(char* rawCommand) {
   } else if (strcmp(cmd, "LED_CLEAR") == 0) {
     clearLEDs();
     Serial.println(F("ok led clear"));
+  } else if (strcmp(cmd, "LED_TEST") == 0) {
+    showLedTest();
+    Serial.println(F("ok led test A1"));
+  } else if (commandStartsWith(cmd, "LED_CELLS")) {
+    char* payload = trimWhitespace(cmd + strlen("LED_CELLS"));
+    int litCount = 0;
+    if (!showLedCells(payload, &litCount)) {
+      Serial.println(F("err invalid led cells"));
+      return;
+    }
+    Serial.print(F("ok led cells "));
+    Serial.println(litCount);
   } else if (strcmp(cmd, "DISPLAY_ON") == 0) {
     displayOn = true;
     Serial.println(F("ok display on"));
@@ -484,7 +646,6 @@ void updateTimedStates() {
     if (millis() - wordChosenTime >= 5000) {
       wordChosen = false;
       inChallengeMode = false;
-      clearLEDs();
     }
   }
 }
@@ -500,7 +661,6 @@ void drawDisplayContent() {
   if (showCountdown) {
     unsigned long elapsed = millis() - countdownStart;
     int remaining = 0;
-
     if (elapsed <= countdownDurationMs) {
       remaining = (countdownDurationMs - elapsed) / 1000UL;
     }
@@ -512,18 +672,26 @@ void drawDisplayContent() {
   } else if (wordChosen) {
     u8g2.setCursor(0, 20);
     u8g2.print(F("Chosen Word:"));
-
     u8g2.setCursor(0, 40);
-    u8g2.print(currentWord());
+    if (activeWordCount() > 0) {
+      u8g2.print(currentWord());
+    } else {
+      u8g2.print(F("No camera words"));
+    }
   } else if (inChallengeMode) {
     u8g2.setCursor(0, 20);
     u8g2.print(F("Challenge Mode"));
-
-    u8g2.setCursor(0, 40);
-    u8g2.print(F("Choose word:"));
-
-    u8g2.setCursor(0, 60);
-    u8g2.print(currentWord());
+    if (activeWordCount() > 0) {
+      u8g2.setCursor(0, 40);
+      u8g2.print(F("Choose word:"));
+      u8g2.setCursor(0, 60);
+      u8g2.print(currentWord());
+    } else {
+      u8g2.setCursor(0, 40);
+      u8g2.print(F("Use camera scan"));
+      u8g2.setCursor(0, 60);
+      u8g2.print(F("then challenge"));
+    }
   } else {
     u8g2.setCursor(30, 32);
     u8g2.print(F("SCRABLIFY"));
@@ -532,10 +700,8 @@ void drawDisplayContent() {
 
 void updateDisplay() {
   unsigned long now = millis();
-
   if (now - lastDisplayRefresh >= DISPLAY_REFRESH_TIME_MS) {
     lastDisplayRefresh = now;
-
     u8g2.firstPage();
     do {
       drawDisplayContent();
@@ -556,7 +722,7 @@ void setup() {
   u8g2.begin();
 
   strip.begin();
-  strip.show();
+  clearLEDs();
 
   actuatorServo.attach(SERVO_PIN);
   writeActuator(SERVO_MIN_ANGLE);

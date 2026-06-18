@@ -31,8 +31,12 @@ from scrabble_plotter.gui import (
 from scrabble_plotter.main import build_parser
 from scrabble_plotter.overlay import cell_label_positions, grid_segments, project_board_points
 from scrabble_plotter.scanner import (
+    CameraLetterScanResult,
+    CameraGridCell,
+    CameraOcrGrid,
     CameraTile,
     CameraWord,
+    CameraWordScanResult,
     PaddleOcrTextBox,
     board_square_from_image_point,
     build_camera_ocr_grid,
@@ -1065,6 +1069,36 @@ class SerialSenderTests(unittest.TestCase):
         self.assertEqual(connection.writes, ["WORD_SET HELLO\n"])
         self.assertEqual(responses, ["ok word set HELLO"])
 
+    def test_board_actuator_sender_formats_word_list_command(self) -> None:
+        connection = _FakeSerialConnection(["ok word list 2\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.set_words(["cat", "dog"])
+
+        self.assertEqual(connection.writes, ["WORD_LIST CAT,DOG\n"])
+        self.assertEqual(responses, ["ok word list 2"])
+
+    def test_board_actuator_sender_formats_word_clear_command(self) -> None:
+        connection = _FakeSerialConnection(["ok word clear\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.clear_words()
+
+        self.assertEqual(connection.writes, ["WORD_CLEAR\n"])
+        self.assertEqual(responses, ["ok word clear"])
+
+    def test_board_actuator_sender_formats_led_cells_command(self) -> None:
+        connection = _FakeSerialConnection(["ok led cells 2\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.set_led_cells(["a1", "c10"])
+
+        self.assertEqual(connection.writes, ["LED_CELLS A1,C10\n"])
+        self.assertEqual(responses, ["ok led cells 2"])
+
 
 class BoardActuatorGuiTests(unittest.TestCase):
     def test_startup_sends_board_up_when_actuator_port_is_saved(self) -> None:
@@ -1126,6 +1160,261 @@ class BoardActuatorGuiTests(unittest.TestCase):
         self.assertIsNone(app._actuator_sender_key)
         self.assertTrue(app._sender.closed)
         self.assertTrue(app.root.destroyed)
+
+    def test_camera_challenge_words_are_unique_normalized_camera_words(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._last_camera_word_scan = type(
+            "Scan",
+            (),
+            {
+                "words": [
+                    CameraWord("cat", "horizontal_left_to_right", 90.0, 0, 0, 10, 10),
+                    CameraWord("CAT", "horizontal_left_to_right", 89.0, 0, 0, 10, 10),
+                    CameraWord("do-g", "vertical_top_to_bottom", 88.0, 0, 0, 10, 10),
+                ],
+                "grid": None,
+            },
+        )()
+
+        words = ScrabblePlotterApp._camera_challenge_words(app)
+
+        self.assertEqual(words, ["CAT", "DOG"])
+
+    def test_send_camera_words_to_actuator_uses_word_list_command(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app.statuses = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok word list 2"]
+        app._set_status = app.statuses.append
+
+        ScrabblePlotterApp._send_camera_words_to_actuator(app, ["CAT", "DOG"])
+
+        self.assertEqual(app.commands, ["WORD_LIST CAT,DOG"])
+        self.assertEqual(app.statuses[-1], "Sent 2 camera word(s) to the board actuator challenge list.")
+
+    def test_try_send_camera_words_to_actuator_clears_when_latest_scan_has_no_words(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("COM9")
+        app._last_camera_word_scan = type("Scan", (), {"words": [], "grid": None})()
+        app.commands = []
+        app.logs = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok word clear"]
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._try_send_camera_words_to_actuator(app)
+
+        self.assertEqual(app.commands, ["WORD_CLEAR"])
+        self.assertIn("Cleared board actuator challenge words", app.logs[-1])
+
+    def test_send_actuator_command_raises_on_arduino_error_response(self) -> None:
+        class Sender:
+            def send_command(self, command: str) -> list[str]:
+                return ["err invalid led grid"]
+
+        app = object.__new__(ScrabblePlotterApp)
+        app.statuses = []
+        app.logs = []
+        app._get_actuator_sender = lambda: Sender()
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+
+        with self.assertRaises(RuntimeError) as raised:
+            ScrabblePlotterApp._send_actuator_command(app, "CHALLENGE_START")
+
+        self.assertIn("err invalid led grid", str(raised.exception))
+        self.assertEqual(app.statuses[-1], "Sent actuator command: CHALLENGE_START")
+        self.assertIn("Actuator responses: err invalid led grid", app.logs[-1])
+
+    def test_start_challenge_sends_camera_words_challenge_then_letter_lights(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._letter_vars[9][2].set("C")
+        app._letter_vars[9][3].set("D")
+        app._last_camera_word_scan = type(
+            "Scan",
+            (),
+            {"words": [CameraWord("cat", "horizontal_left_to_right", 90.0, 0, 0, 10, 10)], "grid": None},
+        )()
+        app._last_camera_letter_scan = None
+        app._last_scan = None
+        app._pending_actuator_challenge_after_word_scan = False
+        app.commands = []
+        app.statuses = []
+        app.errors = []
+        app._capture_best_photo_for_ocr = lambda purpose: (_ for _ in ()).throw(RuntimeError("Start the camera first."))
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.start_actuator_challenge(app)
+
+        labels = ScrabblePlotterApp._current_led_cell_labels(app)
+        self.assertEqual(app.commands, ["WORD_LIST CAT", "CHALLENGE_START", "LED_CELLS C10,D10"])
+        self.assertEqual(app.errors, [])
+        self.assertEqual(app.statuses[-1], "Challenge started with 2 red LED cell(s).")
+        self.assertEqual(labels, ["C10", "D10"])
+
+    def test_start_challenge_does_not_send_blank_letter_lights(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._last_camera_letter_scan = None
+        app._last_camera_word_scan = None
+        app._last_scan = None
+        app._pending_actuator_challenge_after_word_scan = False
+        app.commands = []
+        app.errors = []
+        app._capture_best_photo_for_ocr = lambda purpose: (_ for _ in ()).throw(RuntimeError("Start the camera first."))
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.start_actuator_challenge(app)
+
+        self.assertEqual(app.commands, [])
+        self.assertEqual(len(app.errors), 1)
+        self.assertIn("No board letters", str(app.errors[0]))
+
+    def test_pending_challenge_uses_fresh_camera_word_scan_grid(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._camera_word_scan_token = 4
+        app._camera_word_scan_running = True
+        app._pending_actuator_challenge_after_word_scan = True
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._last_camera_letter_scan = None
+        app._last_scan = None
+        app.commands = []
+        app.statuses = []
+        app.errors = []
+        app._lock_scan_to_manual_board_grid = lambda scan: None
+        app._set_camera_words_text = lambda text: None
+        app._refresh_camera_preview = lambda: None
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+        app._show_error = app.errors.append
+        def apply_grid(grid):
+            for cell in grid.cells:
+                app._letter_vars[cell.row][cell.col].set(cell.letter)
+            return len(grid.cells)
+        app._apply_camera_letter_scan_to_locked_board_grid = lambda scan: 0
+        app._apply_camera_ocr_grid_to_board_form = apply_grid
+
+        scan = CameraWordScanResult(
+            words=[CameraWord("cat", "horizontal_left_to_right", 90.0, 0, 0, 10, 10)],
+            grid=CameraOcrGrid(
+                corners=[],
+                cells=[
+                    CameraGridCell(row=9, col=2, square="C10", letter="C", confidence=90.0, source="test"),
+                    CameraGridCell(row=9, col=3, square="D10", letter="A", confidence=90.0, source="test"),
+                    CameraGridCell(row=9, col=4, square="E10", letter="T", confidence=90.0, source="test"),
+                ],
+            ),
+        )
+
+        ScrabblePlotterApp._handle_camera_word_scan_result(app, scan, announce=False, scan_token=4)
+
+        labels = ScrabblePlotterApp._current_led_cell_labels(app)
+        self.assertEqual(app.commands, ["WORD_LIST CAT", "CHALLENGE_START", "LED_CELLS C10,D10,E10"])
+        self.assertFalse(app._pending_actuator_challenge_after_word_scan)
+        self.assertEqual(app.errors, [])
+        self.assertEqual(labels, ["C10", "D10", "E10"])
+
+    def test_current_led_cell_labels_use_visible_gui_letters_in_column_order(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._letter_vars[9][2].set("C")
+        app._letter_vars[9][3].set("D")
+        app._last_camera_letter_scan = None
+        app._last_camera_word_scan = None
+        app._last_scan = None
+
+        labels = ScrabblePlotterApp._current_led_cell_labels(app)
+
+        self.assertEqual(labels, ["C10", "D10"])
+
+    def test_current_led_cell_labels_ignore_live_camera_overlay_letters(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._letter_vars[9][2].set("C")
+        app._last_camera_letter_scan = type(
+            "Scan",
+            (),
+            {
+                "grid": CameraOcrGrid(
+                    corners=[],
+                    cells=[
+                        CameraGridCell(row=9, col=2, square="C10", letter="C", confidence=90.0, source="test"),
+                        CameraGridCell(row=9, col=3, square="D10", letter="D", confidence=90.0, source="test"),
+                    ],
+                )
+            },
+        )()
+        app._last_camera_word_scan = None
+        app._last_scan = None
+
+        labels = ScrabblePlotterApp._current_led_cell_labels(app)
+
+        self.assertEqual(labels, ["C10"])
+
+    def test_send_led_cells_to_actuator_uses_led_cells_command(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app.statuses = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+
+        ScrabblePlotterApp._send_led_cells_to_actuator(app, ["A1", "C10"])
+
+        self.assertEqual(app.commands, ["LED_CELLS A1,C10"])
+        self.assertEqual(app.statuses[-1], "Sent letter lights to the board actuator (2 lit cell(s)).")
+
+    def test_send_led_cells_to_actuator_rejects_too_long_command(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        labels = [f"{chr(ord('A') + col)}{row}" for col in range(BOARD_SIZE) for row in range(1, BOARD_SIZE + 1)]
+
+        with self.assertRaises(ValueError):
+            ScrabblePlotterApp._send_led_cells_to_actuator(app, labels, announce=False)
+
+        self.assertEqual(app.commands, [])
+
+    def test_reveal_actuator_word_sends_word_choose_only(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app.errors = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.reveal_actuator_word(app)
+
+        self.assertEqual(app.commands, ["WORD_CHOOSE"])
+        self.assertEqual(app.errors, [])
+
+    def test_letter_capture_does_not_clear_tile_rack_side_from_board_grid(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._camera_letter_scan_token = 7
+        app._live_letter_scan_running = True
+        app._last_live_letter_scan_error = "old"
+        app.captured_letters_var = _FakeVar("")
+        app.statuses = []
+        app.logs = []
+        app._lock_scan_to_manual_board_grid = lambda scan: None
+        app._apply_camera_letter_scan_to_locked_board_grid = lambda scan: 0
+        app._apply_camera_ocr_grid_to_board_form = lambda grid: 0
+        app._clear_tile_rack_side_from_main_ocr_grid = lambda: (_ for _ in ()).throw(
+            AssertionError("tile rack side cleanup should not run during letter capture")
+        )
+        app._set_status = app.statuses.append
+        app._refresh_camera_preview = lambda: None
+        app._log = app.logs.append
+        app._try_send_letter_leds_to_actuator = lambda *args, **kwargs: None
+
+        scan = CameraLetterScanResult(letters=[], grid=None)
+
+        ScrabblePlotterApp._handle_camera_letter_scan_result(app, scan, announce=True, scan_token=7)
+
+        self.assertFalse(app._live_letter_scan_running)
+        self.assertEqual(app.captured_letters_var.get(), "")
+        self.assertIn("No letters captured", app.statuses[-1])
 
 class _FakeFrame:
     def __init__(self, shape: tuple[int, ...] = (2, 2, 3)):

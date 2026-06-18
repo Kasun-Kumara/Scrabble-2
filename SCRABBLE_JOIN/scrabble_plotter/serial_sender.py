@@ -178,3 +178,14 @@ class BoardActuatorSender(GCodeSender):
 
     def set_word(self, word: str) -> list[str]:
         return self.send_command(f"WORD_SET {word.strip().upper()}")
+
+    def set_words(self, words: list[str]) -> list[str]:
+        payload = ",".join(word.strip().upper() for word in words if word.strip())
+        return self.send_command(f"WORD_LIST {payload}")
+
+    def clear_words(self) -> list[str]:
+        return self.send_command("WORD_CLEAR")
+
+    def set_led_cells(self, labels: list[str]) -> list[str]:
+        payload = ",".join(label.strip().upper() for label in labels if label.strip())
+        return self.send_command(f"LED_CELLS {payload}")
