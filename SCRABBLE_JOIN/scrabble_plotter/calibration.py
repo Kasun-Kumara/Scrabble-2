@@ -23,6 +23,9 @@ VALID_PREMIUM_CODES = {
 }
 DEFAULT_OCR_CONFIDENCE_THRESHOLD = 50.0
 DEFAULT_OCR_CELL_SIZE_PX = 80
+DEFAULT_ACTUATOR_BAUD = 115200
+DEFAULT_ACTUATOR_TIMEOUT = 2.0
+DEFAULT_ACTUATOR_COUNTDOWN_SECONDS = 30
 
 
 def _require_cv2():
@@ -53,6 +56,10 @@ class PlotterCalibration:
     premium_layout: list[list[str]] = field(default_factory=lambda: default_premium_layout())
     ocr_confidence_threshold: float = DEFAULT_OCR_CONFIDENCE_THRESHOLD
     ocr_cell_size_px: int = DEFAULT_OCR_CELL_SIZE_PX
+    actuator_port: str = ""
+    actuator_baud: int = DEFAULT_ACTUATOR_BAUD
+    actuator_timeout: float = DEFAULT_ACTUATOR_TIMEOUT
+    actuator_countdown_seconds: int = DEFAULT_ACTUATOR_COUNTDOWN_SECONDS
 
     def set_image_corners(
         self,
@@ -129,6 +136,10 @@ class PlotterCalibration:
             "premium_layout": normalize_premium_layout(self.premium_layout, self.board_size),
             "ocr_confidence_threshold": self.ocr_confidence_threshold,
             "ocr_cell_size_px": self.ocr_cell_size_px,
+            "actuator_port": self.actuator_port,
+            "actuator_baud": self.actuator_baud,
+            "actuator_timeout": self.actuator_timeout,
+            "actuator_countdown_seconds": self.actuator_countdown_seconds,
         }
 
     @classmethod
@@ -154,6 +165,12 @@ class PlotterCalibration:
                 payload.get("ocr_confidence_threshold", DEFAULT_OCR_CONFIDENCE_THRESHOLD)
             ),
             ocr_cell_size_px=int(payload.get("ocr_cell_size_px", DEFAULT_OCR_CELL_SIZE_PX)),
+            actuator_port=str(payload.get("actuator_port") or ""),
+            actuator_baud=int(payload.get("actuator_baud", DEFAULT_ACTUATOR_BAUD)),
+            actuator_timeout=float(payload.get("actuator_timeout", DEFAULT_ACTUATOR_TIMEOUT)),
+            actuator_countdown_seconds=int(
+                payload.get("actuator_countdown_seconds", DEFAULT_ACTUATOR_COUNTDOWN_SECONDS)
+            ),
         )
 
     @classmethod

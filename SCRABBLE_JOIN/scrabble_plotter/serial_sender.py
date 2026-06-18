@@ -152,3 +152,29 @@ class GCodeSender:
             if lowered == "ok" or lowered.startswith("ok ") or lowered.startswith("err"):
                 break
         return responses
+
+
+class BoardActuatorSender(GCodeSender):
+    """Serial sender for the second Arduino that controls board actuators."""
+
+    def send_command(self, command: str, *, startup_g90: bool | None = None) -> list[str]:
+        return super().send_command(command, startup_g90=False)
+
+    def send_commands(self, commands: list[str], *, startup_g90: bool | None = None) -> list[str]:
+        return super().send_commands(commands, startup_g90=False)
+
+    def ping(self) -> list[str]:
+        return self.send_command("PING")
+
+    def board_up(self) -> list[str]:
+        return self.send_command("BOARD_UP")
+
+    def board_down(self) -> list[str]:
+        return self.send_command("BOARD_DOWN")
+
+    def countdown(self, seconds: int | None = None) -> list[str]:
+        command = "COUNTDOWN" if seconds is None else f"COUNTDOWN {seconds}"
+        return self.send_command(command)
+
+    def set_word(self, word: str) -> list[str]:
+        return self.send_command(f"WORD_SET {word.strip().upper()}")

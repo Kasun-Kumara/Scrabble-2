@@ -45,8 +45,8 @@ const bool INVERT_Y = true;
 const bool INVERT_Z = false;
 
 // Speed settings
-float maxSpeed = 4000.0;
-float acceleration =900.0;
+float maxSpeed = 3000.0;
+float acceleration =950.0;
 
 // ================= Servo Settings =================
 Servo zServo;

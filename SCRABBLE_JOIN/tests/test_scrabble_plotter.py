@@ -54,6 +54,7 @@ from scrabble_plotter.scanner import (
 )
 from scrabble_plotter.scoring import LETTER_VALUES, score_board, square_label
 from scrabble_plotter.serial_sender import (
+    BoardActuatorSender,
     GCodeSender,
     SerialConfig,
     format_move_command,
@@ -167,6 +168,22 @@ class PlotterCalibrationTests(unittest.TestCase):
         self.assertEqual(loaded.ocr_confidence_threshold, 72.5)
         self.assertEqual(loaded.ocr_cell_size_px, 96)
 
+    def test_persistence_round_trip_includes_actuator_settings(self) -> None:
+        calibration = PlotterCalibration(
+            actuator_port="COM8",
+            actuator_baud=57600,
+            actuator_timeout=1.5,
+            actuator_countdown_seconds=45,
+        )
+
+        payload = json.loads(json.dumps(calibration.to_dict()))
+        loaded = PlotterCalibration.from_dict(payload)
+
+        self.assertEqual(loaded.actuator_port, "COM8")
+        self.assertEqual(loaded.actuator_baud, 57600)
+        self.assertEqual(loaded.actuator_timeout, 1.5)
+        self.assertEqual(loaded.actuator_countdown_seconds, 45)
+
     def test_missing_scan_settings_default_for_old_calibration_files(self) -> None:
         loaded = PlotterCalibration.from_dict({"board_size": BOARD_SIZE})
 
@@ -174,6 +191,10 @@ class PlotterCalibrationTests(unittest.TestCase):
         self.assertEqual(len(loaded.premium_layout[0]), BOARD_SIZE)
         self.assertEqual(loaded.ocr_confidence_threshold, 50.0)
         self.assertEqual(loaded.ocr_cell_size_px, 80)
+        self.assertEqual(loaded.actuator_port, "")
+        self.assertEqual(loaded.actuator_baud, 115200)
+        self.assertEqual(loaded.actuator_timeout, 2.0)
+        self.assertEqual(loaded.actuator_countdown_seconds, 30)
 
     def test_image_path_can_be_stored_relative_to_calibration_file(self) -> None:
         calibration_path = Path("project/calibration/board.json")
@@ -1022,6 +1043,89 @@ class SerialSenderTests(unittest.TestCase):
 
         self.assertEqual(app.sender.calls, [("M1", False)])
         self.assertEqual(responses, ["OK MAGNET ON"])
+
+    def test_board_actuator_sender_never_sends_startup_g90(self) -> None:
+        connection = _FakeSerialConnection(["ok board up\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.board_up()
+
+        self.assertEqual(connection.writes, ["BOARD_UP\n"])
+        self.assertEqual(responses, ["ok board up"])
+        self.assertFalse(connection.closed)
+
+    def test_board_actuator_sender_formats_word_command(self) -> None:
+        connection = _FakeSerialConnection(["ok word set HELLO\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.set_word("hello")
+
+        self.assertEqual(connection.writes, ["WORD_SET HELLO\n"])
+        self.assertEqual(responses, ["ok word set HELLO"])
+
+
+class BoardActuatorGuiTests(unittest.TestCase):
+    def test_startup_sends_board_up_when_actuator_port_is_saved(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("COM9")
+        app.calls = []
+        app.logs = []
+        app._send_actuator_command = lambda command: app.calls.append(command) or ["ok board up"]
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._send_startup_board_up(app)
+
+        self.assertEqual(app.calls, ["BOARD_UP"])
+        self.assertIn("Startup board up command sent.", app.logs)
+
+    def test_startup_skips_board_up_when_no_actuator_port_is_saved(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("")
+        app.calls = []
+        app.logs = []
+        app._send_actuator_command = lambda command: app.calls.append(command)
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._send_startup_board_up(app)
+
+        self.assertEqual(app.calls, [])
+        self.assertIn("Startup board up skipped", app.logs[0])
+
+    def test_close_sends_board_down_and_closes_serial_connections(self) -> None:
+        class Closable:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Root:
+            def __init__(self) -> None:
+                self.destroyed = False
+
+            def destroy(self) -> None:
+                self.destroyed = True
+
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("COM9")
+        app.commands = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok board down"]
+        app._log = lambda message: None
+        app.stop_camera = lambda clear_preview=False: None
+        app._actuator_sender = Closable()
+        app._actuator_sender_key = ("COM9", 115200, 2.0)
+        app._sender = Closable()
+        app.root = Root()
+
+        ScrabblePlotterApp._on_close(app)
+
+        self.assertEqual(app.commands, ["BOARD_DOWN"])
+        self.assertIsNone(app._actuator_sender)
+        self.assertIsNone(app._actuator_sender_key)
+        self.assertTrue(app._sender.closed)
+        self.assertTrue(app.root.destroyed)
 
 class _FakeFrame:
     def __init__(self, shape: tuple[int, ...] = (2, 2, 3)):

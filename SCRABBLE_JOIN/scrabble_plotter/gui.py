@@ -36,6 +36,7 @@ from .scoring import (
     score_board,
 )
 from .serial_sender import (
+    BoardActuatorSender,
     GCodeSender,
     SerialConfig,
     format_move_command,
@@ -65,7 +66,7 @@ class ScrabblePlotterApp:
         self.root.title("Scrabble Join")
         self.root.geometry("1240x820")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(800, self._send_startup_z_up)
+        self.root.after(800, self._send_startup_board_up)
         self.root.after(900, self._install_tile_rack_calibrate_button)
         self.root.after(1000, self._install_tile_rack_letters_panel)
         self.root.after(1050, self._install_live_board_calibrate_button)
@@ -96,6 +97,13 @@ class ScrabblePlotterApp:
         self.command_var = tk.StringVar(value="G0")
         self.timeout_var = tk.StringVar(value="2.0")
         self.startup_g90_var = tk.BooleanVar(value=True)
+        self.actuator_port_var = tk.StringVar(value=self._calibration.actuator_port)
+        self.actuator_baud_var = tk.StringVar(value=str(self._calibration.actuator_baud))
+        self.actuator_timeout_var = tk.StringVar(value=str(self._calibration.actuator_timeout))
+        self.actuator_countdown_seconds_var = tk.StringVar(
+            value=str(self._calibration.actuator_countdown_seconds)
+        )
+        self.actuator_word_var = tk.StringVar(value="")
         self.gemini_api_key_var = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", ""))
         self.gemini_model_var = tk.StringVar(value="gemini-2.5-flash")
         self.gemini_objective_var = tk.StringVar(value="Choose the next board square.")
@@ -142,6 +150,8 @@ class ScrabblePlotterApp:
         self._last_live_word_scan_error: str | None = None
         self._sender: GCodeSender | None = None
         self._sender_key: tuple[str, int, float, bool] | None = None
+        self._actuator_sender: BoardActuatorSender | None = None
+        self._actuator_sender_key: tuple[str, int, float] | None = None
 
         self._build_ui()
         self.refresh_ports()
@@ -296,8 +306,10 @@ class ScrabblePlotterApp:
             row=next_move_row + 5, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
 
+        self._build_board_actuator_controls(controls, row=2)
+
         scan_box = ttk.LabelFrame(controls, text="Camera OCR", padding=10)
-        scan_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        scan_box.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         scan_box.columnconfigure(0, weight=1)
 
         scan_buttons = ttk.Frame(scan_box)
@@ -387,7 +399,7 @@ class ScrabblePlotterApp:
         )
 
         agent_box = ttk.LabelFrame(controls, text="Gemini Agent", padding=10)
-        agent_box.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        agent_box.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         agent_box.columnconfigure(1, weight=1)
 
         agent_fields = [
@@ -413,14 +425,74 @@ class ScrabblePlotterApp:
         )
 
         log_box = ttk.LabelFrame(controls, text="Status", padding=10)
-        log_box.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        log_box.grid(row=5, column=0, sticky="nsew", pady=(12, 0))
         log_box.columnconfigure(0, weight=1)
         log_box.rowconfigure(1, weight=1)
-        controls.rowconfigure(4, weight=1)
+        controls.rowconfigure(5, weight=1)
 
         ttk.Label(log_box, textvariable=self.status_var, wraplength=380).grid(row=0, column=0, sticky="ew")
         self.log_text = tk.Text(log_box, height=14, wrap="word")
         self.log_text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+
+    def _build_board_actuator_controls(self, parent: ttk.Frame, row: int) -> None:
+        actuator_box = ttk.LabelFrame(parent, text="Board Actuator Arduino", padding=10)
+        actuator_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
+        actuator_box.columnconfigure(1, weight=1)
+
+        ttk.Label(actuator_box, text="COM Port").grid(row=0, column=0, sticky="w", pady=2)
+        self.actuator_port_combo = ttk.Combobox(
+            actuator_box,
+            textvariable=self.actuator_port_var,
+            values=[],
+            width=12,
+        )
+        self.actuator_port_combo.grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=2)
+        ttk.Button(actuator_box, text="Refresh", command=self.refresh_ports).grid(
+            row=0, column=2, sticky="ew", pady=2
+        )
+
+        fields = [
+            ("Baud", self.actuator_baud_var),
+            ("Timeout", self.actuator_timeout_var),
+            ("Countdown s", self.actuator_countdown_seconds_var),
+            ("Word", self.actuator_word_var),
+        ]
+        for index, (label, variable) in enumerate(fields, start=1):
+            ttk.Label(actuator_box, text=label).grid(row=index, column=0, sticky="w", pady=2)
+            ttk.Entry(actuator_box, textvariable=variable).grid(
+                row=index, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=2
+            )
+
+        buttons = [
+            ("Save", self.save_actuator_settings),
+            ("Test", self.test_actuator_connection),
+            ("Status", self.request_actuator_status),
+            ("Board Up", self.actuator_board_up),
+            ("Board Down", self.actuator_board_down),
+            ("Countdown", self.start_actuator_countdown),
+            ("Stop Timer", self.stop_actuator_countdown),
+            ("Challenge", self.start_actuator_challenge),
+            ("Cancel Chal.", self.cancel_actuator_challenge),
+            ("Prev Word", self.previous_actuator_word),
+            ("Next Word", self.next_actuator_word),
+            ("Send Word", self.send_actuator_word),
+            ("Reveal Word", self.reveal_actuator_word),
+            ("Clear LEDs", self.clear_actuator_leds),
+            ("Display On", self.actuator_display_on),
+            ("Display Off", self.actuator_display_off),
+        ]
+        button_start_row = len(fields) + 1
+        for index, (label, command) in enumerate(buttons):
+            button_row = button_start_row + index // 3
+            button_col = index % 3
+            padx = (0, 6) if button_col < 2 else (0, 0)
+            ttk.Button(actuator_box, text=label, command=command).grid(
+                row=button_row,
+                column=button_col,
+                sticky="ew",
+                padx=padx,
+                pady=(8 if index < 3 else 6, 0),
+            )
 
     def choose_calibration_file(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -446,6 +518,10 @@ class ScrabblePlotterApp:
         self.cart_y_var.set(str(self._calibration.cart_y_mm))
         self.ocr_confidence_threshold_var.set(str(self._calibration.ocr_confidence_threshold))
         self.ocr_cell_size_px_var.set(str(self._calibration.ocr_cell_size_px))
+        self.actuator_port_var.set(self._calibration.actuator_port)
+        self.actuator_baud_var.set(str(self._calibration.actuator_baud))
+        self.actuator_timeout_var.set(str(self._calibration.actuator_timeout))
+        self.actuator_countdown_seconds_var.set(str(self._calibration.actuator_countdown_seconds))
         self._load_premium_layout_into_form()
         if len(self._calibration.image_corners) == 4:
             self._set_status("Loaded board calibration. Start the camera to find visible words.")
@@ -463,7 +539,23 @@ class ScrabblePlotterApp:
                 f"steps/mm X={self._calibration.x_steps_per_mm:.3f}, "
                 f"Y={self._calibration.y_steps_per_mm:.3f}; "
                 f"cart X={self._calibration.cart_x_mm:.3f}, "
-                f"Y={self._calibration.cart_y_mm:.3f}"
+                f"Y={self._calibration.cart_y_mm:.3f}; "
+                f"actuator port={self._calibration.actuator_port or 'not set'}"
+            )
+        except Exception as exc:
+            self._show_error(exc)
+
+    def save_actuator_settings(self) -> None:
+        try:
+            self._calibration = self._calibration_from_form()
+            self._calibration.save(self.calibration_path.get())
+            self._set_status("Saved board actuator settings.")
+            self._log(
+                "Board actuator saved: "
+                f"port={self._calibration.actuator_port or 'not set'}, "
+                f"baud={self._calibration.actuator_baud}, "
+                f"timeout={self._calibration.actuator_timeout:.3f}, "
+                f"countdown={self._calibration.actuator_countdown_seconds}s"
             )
         except Exception as exc:
             self._show_error(exc)
@@ -4910,6 +5002,9 @@ class ScrabblePlotterApp:
             ports = list_serial_ports()
             if ports and not self.port_var.get().strip():
                 self.port_var.set(ports[0])
+            actuator_combo = getattr(self, "actuator_port_combo", None)
+            if actuator_combo is not None:
+                actuator_combo.configure(values=ports)
             if ports:
                 self._log("Available ports: " + ", ".join(ports))
             else:
@@ -5095,6 +5190,12 @@ class ScrabblePlotterApp:
         calibration.cart_y_mm = float(self.cart_y_var.get())
         calibration.ocr_confidence_threshold = float(self.ocr_confidence_threshold_var.get())
         calibration.ocr_cell_size_px = int(self.ocr_cell_size_px_var.get())
+        calibration.actuator_port = self.actuator_port_var.get().strip()
+        calibration.actuator_baud = int(self.actuator_baud_var.get())
+        calibration.actuator_timeout = float(self.actuator_timeout_var.get())
+        calibration.actuator_countdown_seconds = int(float(self.actuator_countdown_seconds_var.get()))
+        if calibration.actuator_countdown_seconds <= 0:
+            raise ValueError("Actuator countdown seconds must be greater than 0.")
         calibration.premium_layout = self._premium_layout_from_form()
         return calibration
 
@@ -5164,6 +5265,130 @@ class ScrabblePlotterApp:
         value = raw.strip()
         return float(value) if value else None
 
+    def _actuator_config(self) -> SerialConfig:
+        config = SerialConfig(
+            port=self.actuator_port_var.get().strip(),
+            baud=int(self.actuator_baud_var.get()),
+            timeout=float(self.actuator_timeout_var.get()),
+            startup_g90=False,
+        )
+        if not config.port:
+            raise ValueError("Enter the Board Actuator Arduino COM port, for example COM4.")
+        return config
+
+    def _get_actuator_sender(self) -> BoardActuatorSender:
+        config = self._actuator_config()
+        sender_key = (config.port, config.baud, config.timeout)
+        if self._actuator_sender is not None and self._actuator_sender_key == sender_key:
+            return self._actuator_sender
+
+        if self._actuator_sender is not None:
+            self._actuator_sender.close()
+
+        self._actuator_sender = BoardActuatorSender(config)
+        self._actuator_sender.open()
+        self._actuator_sender_key = sender_key
+        self._log(f"Connected to Board Actuator Arduino on {config.port} at {config.baud} baud.")
+        return self._actuator_sender
+
+    def _send_actuator_command(self, command: str) -> list[str]:
+        command = command.strip()
+        if not command:
+            return []
+        sender = self._get_actuator_sender()
+        responses = sender.send_command(command)
+        self._set_status(f"Sent actuator command: {command}")
+        self._log(f"Sent actuator command: {command}")
+        if responses:
+            self._log("Actuator responses: " + " | ".join(responses))
+        return responses
+
+    def test_actuator_connection(self) -> None:
+        try:
+            self._send_actuator_command("PING")
+            self._set_status("Board Actuator Arduino responded.")
+        except Exception as exc:
+            self._show_error(exc)
+
+    def request_actuator_status(self) -> None:
+        self._send_actuator_button_command("STATUS")
+
+    def actuator_board_up(self) -> None:
+        self._send_actuator_button_command("BOARD_UP")
+
+    def actuator_board_down(self) -> None:
+        self._send_actuator_button_command("BOARD_DOWN")
+
+    def start_actuator_countdown(self) -> None:
+        try:
+            seconds = int(float(self.actuator_countdown_seconds_var.get()))
+            if seconds <= 0:
+                raise ValueError("Actuator countdown seconds must be greater than 0.")
+            self._send_actuator_command(f"COUNTDOWN {seconds}")
+        except Exception as exc:
+            self._show_error(exc)
+
+    def stop_actuator_countdown(self) -> None:
+        self._send_actuator_button_command("COUNTDOWN_STOP")
+
+    def start_actuator_challenge(self) -> None:
+        self._send_actuator_button_command("CHALLENGE_START")
+
+    def cancel_actuator_challenge(self) -> None:
+        self._send_actuator_button_command("CHALLENGE_CANCEL")
+
+    def previous_actuator_word(self) -> None:
+        self._send_actuator_button_command("WORD_PREV")
+
+    def next_actuator_word(self) -> None:
+        self._send_actuator_button_command("WORD_NEXT")
+
+    def send_actuator_word(self) -> None:
+        try:
+            word = self.actuator_word_var.get().strip().upper()
+            if not word:
+                raise ValueError("Enter a word before sending it to the actuator Arduino.")
+            self._send_actuator_command(f"WORD_SET {word}")
+        except Exception as exc:
+            self._show_error(exc)
+
+    def reveal_actuator_word(self) -> None:
+        self._send_actuator_button_command("WORD_CHOOSE")
+
+    def clear_actuator_leds(self) -> None:
+        self._send_actuator_button_command("LED_CLEAR")
+
+    def actuator_display_on(self) -> None:
+        self._send_actuator_button_command("DISPLAY_ON")
+
+    def actuator_display_off(self) -> None:
+        self._send_actuator_button_command("DISPLAY_OFF")
+
+    def _send_actuator_button_command(self, command: str) -> None:
+        try:
+            self._send_actuator_command(command)
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _send_startup_board_up(self) -> None:
+        if not self.actuator_port_var.get().strip():
+            self._log("Startup board up skipped: no Board Actuator Arduino COM port saved.")
+            return
+        try:
+            self._send_actuator_command("BOARD_UP")
+            self._log("Startup board up command sent.")
+        except Exception as exc:
+            self._log(f"Startup board up command skipped: {exc}")
+
+    def _send_shutdown_board_down(self) -> None:
+        if not self.actuator_port_var.get().strip():
+            return
+        try:
+            self._send_actuator_command("BOARD_DOWN")
+            self._log("Shutdown board down command sent.")
+        except Exception as exc:
+            self._log(f"Shutdown board down command skipped: {exc}")
+
     def _serial_config(self) -> SerialConfig:
         config = SerialConfig(
             port=self.port_var.get().strip(),
@@ -5192,9 +5417,16 @@ class ScrabblePlotterApp:
 
     def _on_close(self) -> None:
         self.stop_camera(clear_preview=False)
-        if self._sender is not None:
-            self._sender.close()
-        self.root.destroy()
+        try:
+            self._send_shutdown_board_down()
+        finally:
+            if self._actuator_sender is not None:
+                self._actuator_sender.close()
+                self._actuator_sender = None
+                self._actuator_sender_key = None
+            if self._sender is not None:
+                self._sender.close()
+            self.root.destroy()
 
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
