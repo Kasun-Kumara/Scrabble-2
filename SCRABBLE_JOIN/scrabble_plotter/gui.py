@@ -65,6 +65,10 @@ class ScrabblePlotterApp:
         self.root.geometry("1240x820")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(800, self._send_startup_z_up)
+        self.root.after(900, self._install_tile_rack_calibrate_button)
+        self.root.after(1000, self._install_tile_rack_letters_panel)
+        self.root.after(1050, self._install_live_board_calibrate_button)
+        self.root.after(1150, self._install_board_cell_margin_feature)
         self._z_axis_controls_frame = None
         self.z_height_angle = tk.IntVar(value=80)
         self.root.after(500, self._add_z_axis_controls_to_move_section)
@@ -576,7 +580,6 @@ class ScrabblePlotterApp:
 
     def _send_tile_rack_target_move(self, target: str) -> None:
         self._ensure_tile_rack_move_state()
-        self._send_pick_drop_aux_command("ZU")
         slot_index = int(target[2:]) - 1
         x, y = self._tile_rack_slot_position(slot_index)
         feed = float(self.tile_rack_feed_var.get())
@@ -591,6 +594,1640 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self._show_error(exc)
 
+    def _install_tile_rack_calibrate_button(self) -> None:
+        if getattr(self, "_tile_rack_calibrate_button_installed", False):
+            return
+
+        board_button = self._find_button_by_text(self.root, "Calibrate Board")
+        if board_button is None:
+            self.root.after(700, self._install_tile_rack_calibrate_button)
+            return
+
+        parent = board_button.master
+        grid_info = board_button.grid_info()
+        try:
+            row = int(grid_info.get("row", 0))
+            column = int(grid_info.get("column", 0)) + int(grid_info.get("columnspan", 1))
+        except Exception:
+            row = 0
+            column = 0
+
+        button = ttk.Button(parent, text="Calibrate Tile Rack", command=self.calibrate_tile_rack)
+        button.grid(row=row, column=column, sticky=grid_info.get("sticky", ""), padx=(8, 0), pady=grid_info.get("pady", 0))
+        self._tile_rack_calibrate_button_installed = True
+
+    def _find_button_by_text(self, widget, text: str):  # type: ignore[no-untyped-def]
+        try:
+            if widget.winfo_class() in {"TButton", "Button"} and str(widget.cget("text")) == text:
+                return widget
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            found = self._find_button_by_text(child, text)
+            if found is not None:
+                return found
+        return None
+
+    def _install_tile_rack_preview_click_handler(self) -> None:
+        preview = getattr(self, "preview_label", None)
+        if preview is None:
+            self.root.after(700, self._install_tile_rack_preview_click_handler)
+            return
+        try:
+            preview.bind("<Button-1>", self._handle_preview_click_with_tile_rack_calibration)
+        except Exception:
+            self.root.after(700, self._install_tile_rack_preview_click_handler)
+
+    def _install_tile_rack_letters_panel(self) -> None:
+        if getattr(self, "_tile_rack_letters_panel_installed", False):
+            return
+
+        anchor = self._find_button_by_text(self.root, "Tile Rack Position") or self._find_button_by_text(
+            self.root, "Calibrate Tile Rack"
+        )
+        if anchor is None:
+            self.root.after(700, self._install_tile_rack_letters_panel)
+            return
+
+        self._ensure_tile_rack_move_state()
+        parent = anchor.master
+        max_row = 0
+        for child in parent.winfo_children():
+            try:
+                info = child.grid_info()
+                max_row = max(max_row, int(info.get("row", 0)) + int(info.get("rowspan", 1)) - 1)
+            except Exception:
+                continue
+
+        panel = ttk.LabelFrame(parent, text="Tile Rack Letters")
+        panel.grid(row=max_row + 1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self._build_tile_rack_letter_grid(panel)
+        ttk.Button(panel, text="Suggest Rack Words", command=self.suggest_tile_rack_words).grid(
+            row=7, column=0, columnspan=2, sticky="ew", padx=6, pady=(8, 4)
+        )
+        ttk.Label(
+            panel,
+            textvariable=self.tile_rack_word_suggestions_var,
+            anchor="nw",
+            justify="left",
+            wraplength=260,
+        ).grid(row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self._tile_rack_letters_panel_installed = True
+
+    def _install_board_cell_margin_feature(self) -> None:
+        if getattr(self, "_board_cell_margin_feature_installed", False):
+            return
+
+        if not hasattr(self, "board_cell_margin_var"):
+            self.board_cell_margin_var = tk.StringVar(value="0")
+
+        self._wrap_calibration_form_with_cell_margin()
+        if self._place_board_cell_margin_input():
+            self._board_cell_margin_feature_installed = True
+        else:
+            self.root.after(700, self._install_board_cell_margin_feature)
+
+    def _wrap_calibration_form_with_cell_margin(self) -> None:
+        if getattr(self, "_board_cell_margin_calibration_wrapped", False):
+            return
+
+        original = getattr(self, "_calibration_from_form", None)
+        if not callable(original):
+            return
+
+        def calibration_from_form_with_margin():  # type: ignore[no-untyped-def]
+            calibration = original()
+            try:
+                calibration.cell_margin_mm = float(self.board_cell_margin_var.get())
+            except Exception:
+                calibration.cell_margin_mm = 0.0
+            return calibration
+
+        self._calibration_from_form = calibration_from_form_with_margin
+        self._board_cell_margin_calibration_wrapped = True
+
+    def _place_board_cell_margin_input(self) -> bool:
+        anchor = self._find_widget_by_text_contains(self.root, "cell size")
+        if anchor is None:
+            anchor = self._find_button_by_text(self.root, "Calibrate Board")
+        if anchor is None:
+            return False
+
+        parent = anchor.master
+        try:
+            grid_info = anchor.grid_info()
+            row = int(grid_info.get("row", 0))
+            column = int(grid_info.get("column", 0)) + int(grid_info.get("columnspan", 1)) + 1
+            sticky = grid_info.get("sticky", "w")
+        except Exception:
+            row = 0
+            column = 0
+            sticky = "w"
+
+        ttk.Label(parent, text="Cell margin").grid(row=row, column=column, sticky=sticky, padx=(8, 4), pady=2)
+        ttk.Entry(parent, textvariable=self.board_cell_margin_var, width=8).grid(
+            row=row,
+            column=column + 1,
+            sticky="ew",
+            padx=(0, 6),
+            pady=2,
+        )
+        return True
+
+    def _find_widget_by_text_contains(self, widget, text: str):  # type: ignore[no-untyped-def]
+        wanted = text.lower()
+        try:
+            value = str(widget.cget("text")).lower()
+            if wanted in value:
+                return widget
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            found = self._find_widget_by_text_contains(child, text)
+            if found is not None:
+                return found
+        return None
+
+    def _install_live_board_calibrate_button(self) -> None:
+        if getattr(self, "_live_board_calibrate_button_installed", False):
+            return
+
+        button = self._find_button_by_text(self.root, "Calibrate Board")
+        if button is None:
+            self.root.after(700, self._install_live_board_calibrate_button)
+            return
+
+        try:
+            button.configure(command=self.calibrate_board_on_live_camera)
+            self._live_board_calibrate_button_installed = True
+        except Exception:
+            self.root.after(700, self._install_live_board_calibrate_button)
+
+    def calibrate_board_on_live_camera(self) -> None:
+        frame = self._current_camera_ocr_frame()
+        if frame is None:
+            self._show_error(RuntimeError("Start the camera first so the board can be calibrated on the live image."))
+            return
+
+        self._board_corner_selection_active = True
+        self._board_corner_selection_points = []
+        self._bind_live_board_corner_clicks()
+        self._set_status("Click board top-left corner on the live camera.")
+        log = getattr(self, "_log", None)
+        if callable(log):
+            log("Board live-camera calibration started.")
+        self._refresh_camera_preview()
+
+    def _bind_live_board_corner_clicks(self) -> None:
+        preview = getattr(self, "preview_label", None)
+        if preview is None:
+            raise RuntimeError("Start the camera first so the board can be calibrated on the live image.")
+
+        if not getattr(self, "_board_live_click_binding_active", False):
+            try:
+                self._board_previous_preview_click_binding = preview.bind("<Button-1>")
+            except Exception:
+                self._board_previous_preview_click_binding = ""
+        preview.bind("<Button-1>", self._handle_board_live_corner_click)
+        self._board_live_click_binding_active = True
+
+    def _restore_live_board_corner_clicks(self) -> None:
+        preview = getattr(self, "preview_label", None)
+        if preview is None:
+            return
+
+        previous_binding = getattr(self, "_board_previous_preview_click_binding", "")
+        try:
+            preview.bind("<Button-1>", previous_binding)
+        except Exception:
+            pass
+        self._board_live_click_binding_active = False
+        self._board_previous_preview_click_binding = ""
+
+    def _handle_board_live_corner_click(self, event) -> None:  # type: ignore[no-untyped-def]
+        image_point = self._preview_click_to_frame_point(event.x, event.y)
+        if image_point is None:
+            self._set_status("Click inside the live camera image.")
+            return
+
+        points = list(getattr(self, "_board_corner_selection_points", []))
+        points.append((float(image_point[0]), float(image_point[1])))
+        self._board_corner_selection_points = points
+
+        corner_names = ("top-left", "top-right", "bottom-right", "bottom-left")
+        if len(points) < 4:
+            next_name = corner_names[len(points)]
+            self._set_status(f"Board corner {len(points)} saved. Click {next_name} corner next.")
+            self._refresh_camera_preview()
+            return
+
+        self._apply_live_board_corner_calibration(points[:4])
+        self._board_corner_selection_active = False
+        self._board_corner_selection_points = []
+        self._restore_live_board_corner_clicks()
+        self._set_status("Board calibrated from live camera corners.")
+        self._refresh_camera_preview()
+
+    def _apply_live_board_corner_calibration(self, corners) -> None:  # type: ignore[no-untyped-def]
+        normalized = [[float(x), float(y)] for x, y in corners]
+        grid = self._current_camera_ocr_grid_for_manual_lock()
+        if grid is None:
+            try:
+                from .scanner import build_camera_ocr_grid
+
+                frame = self._current_camera_ocr_frame()
+                grid = build_camera_ocr_grid(frame) if frame is not None else None
+            except Exception:
+                grid = None
+
+        if grid is not None:
+            self._set_grid_corners(grid, normalized)
+            self._manual_board_ocr_grid_lock = self._clone_camera_grid(grid)
+            self._fallback_camera_ocr_grid = self._clone_camera_grid(grid)
+        else:
+            import types
+
+            simple_grid = types.SimpleNamespace(corners=normalized, board_size=BOARD_SIZE)
+            self._manual_board_ocr_grid_lock = simple_grid
+            self._fallback_camera_ocr_grid = simple_grid
+
+        log = getattr(self, "_log", None)
+        if callable(log):
+            log(f"Board live-camera calibration corners: {normalized}")
+
+    def _install_manual_board_grid_lock(self) -> None:
+        if getattr(self, "_manual_board_grid_lock_installed", False):
+            return
+
+        button = self._find_button_by_text(self.root, "Calibrate Board")
+        if button is None:
+            self.root.after(700, self._install_manual_board_grid_lock)
+            return
+
+        original = getattr(self, "_original_calibrate_camera_board", None)
+        if original is None:
+            original = getattr(self, "calibrate_camera_board", None)
+            self._original_calibrate_camera_board = original
+        if not callable(original):
+            return
+
+        try:
+            button.configure(command=self._calibrate_camera_board_and_lock_grid)
+            self._manual_board_grid_lock_installed = True
+        except Exception:
+            self.root.after(700, self._install_manual_board_grid_lock)
+
+    def _calibrate_camera_board_and_lock_grid(self) -> None:
+        original = getattr(self, "_original_calibrate_camera_board", None)
+        if callable(original):
+            original()
+        self.root.after(300, lambda: self._capture_manual_board_grid_lock(remaining_attempts=20))
+
+    def _capture_manual_board_grid_lock(self, remaining_attempts: int = 0) -> None:
+        grid = self._current_camera_ocr_grid_for_manual_lock()
+        if grid is None:
+            if remaining_attempts > 0:
+                self.root.after(300, lambda: self._capture_manual_board_grid_lock(remaining_attempts - 1))
+            return
+
+        self._manual_board_ocr_grid_lock = self._clone_camera_grid(grid)
+        self._set_status("Manual board grid locked for board scans.")
+        self._log("Manual board grid locked. Future board scans will reuse this grid layout.")
+
+    def _current_camera_ocr_grid_for_manual_lock(self):  # type: ignore[no-untyped-def]
+        for source_name in ("_last_camera_word_scan", "_last_camera_letter_scan"):
+            scan = getattr(self, source_name, None)
+            grid = getattr(scan, "grid", None)
+            if grid is not None and getattr(grid, "corners", None):
+                return grid
+
+        for source_name in (
+            "_manual_camera_ocr_grid",
+            "_manual_board_ocr_grid",
+            "_calibrated_camera_ocr_grid",
+            "_camera_ocr_grid",
+            "_fallback_camera_ocr_grid",
+        ):
+            grid = getattr(self, source_name, None)
+            if grid is not None and getattr(grid, "corners", None):
+                return grid
+
+        try:
+            grid = self._current_camera_ocr_grid()
+            if grid is not None and getattr(grid, "corners", None):
+                return grid
+        except Exception:
+            pass
+        return None
+
+    def _clone_camera_grid(self, grid):  # type: ignore[no-untyped-def]
+        try:
+            import copy
+
+            return copy.deepcopy(grid)
+        except Exception:
+            return grid
+
+    def _lock_scan_to_manual_board_grid(self, scan) -> None:  # type: ignore[no-untyped-def]
+        locked_grid = getattr(self, "_manual_board_ocr_grid_lock", None)
+        if locked_grid is None:
+            return
+
+        grid = getattr(scan, "grid", None)
+        if grid is None:
+            return
+
+        locked_corners = getattr(locked_grid, "corners", None)
+        if not locked_corners or len(locked_corners) != 4:
+            return
+
+        self._set_grid_corners(grid, locked_corners)
+
+    def _apply_camera_letter_scan_to_locked_board_grid(self, scan) -> int:  # type: ignore[no-untyped-def]
+        locked_grid = getattr(self, "_manual_board_ocr_grid_lock", None) or getattr(self, "_fallback_camera_ocr_grid", None)
+        corners = getattr(locked_grid, "corners", None)
+        entries = getattr(self, "_letter_entries", None)
+        if not corners or len(corners) != 4 or not entries:
+            return 0
+
+        placements: dict[tuple[int, int], str] = {}
+        rack_corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        for item in getattr(scan, "letters", []) or []:
+            center = self._tile_rack_camera_item_center(item)
+            if center is None:
+                continue
+            if rack_corners and len(rack_corners) == 4:
+                rack_slot = self._tile_rack_slot_index_from_camera_corners(rack_corners, center[0], center[1])
+                if rack_slot is not None:
+                    continue
+            row_col = self._board_row_col_from_camera_corners(corners, center[0], center[1])
+            if row_col is None:
+                continue
+            letter = self._tile_rack_camera_item_letter(item)
+            if letter:
+                placements[row_col] = letter
+
+        if not placements:
+            return 0
+
+        self._clear_main_board_ocr_entries()
+        for (row, col), letter in placements.items():
+            self._set_main_ocr_entry(row, col, letter)
+        return len(placements)
+
+    def _board_row_col_from_camera_corners(self, corners, x: float, y: float) -> tuple[int, int] | None:  # type: ignore[no-untyped-def]
+        try:
+            cv2 = _require_cv2()
+            import numpy as np
+        except Exception:
+            return None
+
+        try:
+            source = np.array(corners, dtype=np.float32)
+            destination = np.array(
+                [(0.0, 0.0), (float(BOARD_SIZE), 0.0), (float(BOARD_SIZE), float(BOARD_SIZE)), (0.0, float(BOARD_SIZE))],
+                dtype=np.float32,
+            )
+            transform = cv2.getPerspectiveTransform(source, destination)
+            point = np.array([[[float(x), float(y)]]], dtype=np.float32)
+            mapped = cv2.perspectiveTransform(point, transform)[0][0]
+        except Exception:
+            return None
+
+        grid_x = float(mapped[0])
+        grid_y = float(mapped[1])
+        if grid_x < -0.05 or grid_x > BOARD_SIZE + 0.05 or grid_y < -0.05 or grid_y > BOARD_SIZE + 0.05:
+            return None
+        col = max(0, min(BOARD_SIZE - 1, int(grid_x)))
+        row = max(0, min(BOARD_SIZE - 1, int(grid_y)))
+        return row, col
+
+    def _clear_main_board_ocr_entries(self) -> None:
+        entries = getattr(self, "_letter_entries", None)
+        if not entries:
+            return
+        for row in range(min(BOARD_SIZE, len(entries))):
+            for col in range(min(BOARD_SIZE, len(entries[row]))):
+                self._clear_main_ocr_entry(row, col)
+
+    def _set_main_ocr_entry(self, row: int, col: int, letter: str) -> None:
+        try:
+            entry = self._letter_entries[row][col]
+        except Exception:
+            return
+        try:
+            old_state = str(entry.cget("state"))
+        except Exception:
+            old_state = ""
+        try:
+            if old_state == "readonly":
+                entry.configure(state="normal")
+            entry.delete(0, tk.END)
+            entry.insert(0, str(letter).upper()[:1])
+        finally:
+            if old_state == "readonly":
+                entry.configure(state=old_state)
+
+    def _handle_preview_click_with_tile_rack_calibration(self, event) -> None:  # type: ignore[no-untyped-def]
+        if getattr(self, "_tile_rack_corner_selection_active", False):
+            self._handle_tile_rack_corner_preview_click(event)
+            return
+        self._handle_preview_click(event)
+
+    def _handle_tile_rack_corner_preview_click(self, event) -> None:  # type: ignore[no-untyped-def]
+        image_point = self._preview_click_to_frame_point(event.x, event.y)
+        if image_point is None:
+            self._set_status("Click inside the camera image.")
+            return
+
+        points = list(getattr(self, "_tile_rack_corner_selection_points", []))
+        points.append((float(image_point[0]), float(image_point[1])))
+        self._tile_rack_corner_selection_points = points
+
+        corner_names = ("top-left", "top-right", "bottom-right", "bottom-left")
+        if len(points) < 4:
+            next_name = corner_names[len(points)]
+            self.tile_rack_status_var.set(f"Rack corner {len(points)} saved. Click {next_name} corner next.")
+            self._set_status(f"Rack corner {len(points)} saved. Click {next_name} corner next.")
+            self._refresh_camera_preview()
+            return
+
+        self._tile_rack_calibrated_corners = points[:4]
+        self._tile_rack_calibrated_rect = None
+        self._last_tile_rack_camera_rect = None
+        self._tile_rack_corner_selection_active = False
+        self._tile_rack_corner_selection_points = []
+        self._restore_live_tile_rack_corner_clicks()
+        source = getattr(self, "_tile_rack_calibration_source", "camera image")
+        self.tile_rack_status_var.set("Tile rack calibrated from clicked image corners.")
+        self._set_status("Tile rack calibrated from the clicked corners.")
+        self._log(f"Tile rack calibrated from {source}: {self._tile_rack_calibrated_corners}")
+        self._refresh_camera_preview()
+
+    def _bind_live_tile_rack_corner_clicks(self) -> None:
+        preview = getattr(self, "preview_label", None)
+        if preview is None:
+            raise RuntimeError("Start the camera first so the tile rack can be calibrated on the live image.")
+
+        if not getattr(self, "_tile_rack_live_click_binding_active", False):
+            try:
+                self._tile_rack_previous_preview_click_binding = preview.bind("<Button-1>")
+            except Exception:
+                self._tile_rack_previous_preview_click_binding = ""
+        preview.bind("<Button-1>", self._handle_tile_rack_live_corner_click)
+        self._tile_rack_live_click_binding_active = True
+
+    def _restore_live_tile_rack_corner_clicks(self) -> None:
+        preview = getattr(self, "preview_label", None)
+        if preview is None:
+            return
+
+        previous_binding = getattr(self, "_tile_rack_previous_preview_click_binding", "")
+        try:
+            preview.bind("<Button-1>", previous_binding)
+        except Exception:
+            pass
+        self._tile_rack_live_click_binding_active = False
+        self._tile_rack_previous_preview_click_binding = ""
+
+    def _handle_tile_rack_live_corner_click(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._handle_tile_rack_corner_preview_click(event)
+
+    def calibrate_tile_rack(self) -> None:
+        self._ensure_tile_rack_move_state()
+        try:
+            frame = getattr(self, "_last_displayed_camera_frame_for_ocr", None)
+            if frame is None:
+                frame = getattr(self, "_latest_frame", None)
+            if frame is None:
+                frame, quality = self._capture_best_photo_for_ocr("tile rack calibration")
+                self._captured_photo_frame = frame.copy()
+                source = f"best camera frame, sharpness {quality.sharpness:.0f}"
+            else:
+                source = "live camera"
+
+            self._tile_rack_corner_selection_active = True
+            self._tile_rack_corner_selection_points = []
+            self._tile_rack_calibrated_corners = None
+            self._tile_rack_calibrated_rect = None
+            self._last_tile_rack_camera_rect = None
+            self._tile_rack_calibration_source = source
+            self._bind_live_tile_rack_corner_clicks()
+            self.tile_rack_status_var.set(
+                "Click tile rack corners on the live camera: top-left, top-right, bottom-right, bottom-left."
+            )
+            self._set_status("Click top-left tile rack corner on the live camera.")
+            self._log(f"Tile rack live-camera calibration started from {source}.")
+            refresh = getattr(self, "_refresh_camera_preview", None)
+            if callable(refresh):
+                refresh()
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _open_tile_rack_image_corner_window(self, frame, source: str) -> None:  # type: ignore[no-untyped-def]
+        existing_window = getattr(self, "_tile_rack_image_corner_window", None)
+        if existing_window is not None and existing_window.winfo_exists():
+            existing_window.lift()
+            existing_window.focus_force()
+            return
+
+        self._tile_rack_corner_image_frame = frame.copy()
+        self._tile_rack_corner_selection_points = []
+        self._tile_rack_corner_selection_active = False
+        self._tile_rack_calibrated_corners = None
+        self._tile_rack_calibrated_rect = None
+        self._last_tile_rack_camera_rect = None
+        self._tile_rack_calibration_source = source
+
+        window = tk.Toplevel(self.root)
+        self._tile_rack_image_corner_window = window
+        window.title("Calibrate Tile Rack")
+        window.columnconfigure(0, weight=1)
+        window.columnconfigure(1, weight=0)
+        window.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            window,
+            text="Click the tile rack corners on the image in this order: top-left, top-right, bottom-right, bottom-left.",
+            wraplength=760,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 6))
+
+        self._tile_rack_corner_image_label = ttk.Label(window, cursor="crosshair")
+        self._tile_rack_corner_image_label.grid(row=1, column=0, sticky="nsew", padx=(10, 6), pady=6)
+        self._tile_rack_corner_image_label.bind("<Button-1>", self._handle_tile_rack_image_corner_click)
+
+        side = ttk.Frame(window)
+        side.grid(row=1, column=1, sticky="ns", padx=(6, 10), pady=6)
+        self._tile_rack_corner_status_var = tk.StringVar(value="Next: top-left")
+        ttk.Label(side, textvariable=self._tile_rack_corner_status_var, wraplength=190).grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8)
+        )
+
+        corner_names = ("top-left", "top-right", "bottom-right", "bottom-left")
+        self._tile_rack_image_corner_value_vars = []
+        for index, name in enumerate(corner_names):
+            ttk.Label(side, text=name).grid(row=index + 1, column=0, sticky="w", pady=3)
+            value_var = tk.StringVar(value="not selected")
+            self._tile_rack_image_corner_value_vars.append(value_var)
+            ttk.Label(side, textvariable=value_var, width=18).grid(row=index + 1, column=1, sticky="w", pady=3)
+
+        ttk.Button(side, text="Reset Corners", command=self._reset_tile_rack_image_corner_selection).grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=(10, 4)
+        )
+        ttk.Button(side, text="Close", command=window.destroy).grid(
+            row=6, column=0, columnspan=2, sticky="ew", pady=4
+        )
+
+        self.tile_rack_status_var.set("Click top-left tile rack corner in the calibration image.")
+        self._set_status("Click top-left tile rack corner in the calibration image.")
+        self._refresh_tile_rack_corner_window_image()
+
+    def _handle_tile_rack_image_corner_click(self, event) -> None:  # type: ignore[no-untyped-def]
+        frame = getattr(self, "_tile_rack_corner_image_frame", None)
+        if frame is None:
+            return
+
+        frame_height, frame_width = frame.shape[:2]
+        image_width, image_height = getattr(self, "_tile_rack_corner_display_size", (0, 0))
+        if image_width <= 0 or image_height <= 0:
+            return
+        if event.x < 0 or event.y < 0 or event.x > image_width or event.y > image_height:
+            self._set_status("Click inside the tile rack calibration image.")
+            return
+
+        points = list(getattr(self, "_tile_rack_corner_selection_points", []))
+        if len(points) >= 4:
+            return
+
+        x = float(event.x) * float(frame_width) / float(image_width)
+        y = float(event.y) * float(frame_height) / float(image_height)
+        points.append((x, y))
+        self._tile_rack_corner_selection_points = points
+
+        corner_names = ("top-left", "top-right", "bottom-right", "bottom-left")
+        value_vars = getattr(self, "_tile_rack_image_corner_value_vars", [])
+        if len(points) <= len(value_vars):
+            value_vars[len(points) - 1].set(f"X{int(round(x))} Y{int(round(y))}")
+
+        if len(points) < 4:
+            next_name = corner_names[len(points)]
+            self._tile_rack_corner_status_var.set(f"Next: {next_name}")
+            self.tile_rack_status_var.set(f"Rack corner {len(points)} saved. Click {next_name}.")
+            self._set_status(f"Rack corner {len(points)} saved. Click {next_name}.")
+        else:
+            self._apply_tile_rack_image_corner_selection()
+
+        self._refresh_tile_rack_corner_window_image()
+
+    def _apply_tile_rack_image_corner_selection(self) -> None:
+        points = list(getattr(self, "_tile_rack_corner_selection_points", []))
+        if len(points) != 4:
+            return
+
+        self._tile_rack_calibrated_corners = points[:4]
+        self._tile_rack_calibrated_rect = None
+        self._last_tile_rack_camera_rect = None
+        self._tile_rack_corner_selection_active = False
+        source = getattr(self, "_tile_rack_calibration_source", "camera image")
+        if hasattr(self, "_tile_rack_corner_status_var"):
+            self._tile_rack_corner_status_var.set("Done. Tile rack corners calibrated.")
+        self.tile_rack_status_var.set("Tile rack calibrated from image corners.")
+        self._set_status("Tile rack calibrated from image corners.")
+        self._log(f"Tile rack calibrated from {source}: {self._tile_rack_calibrated_corners}")
+        refresh = getattr(self, "_refresh_camera_preview", None)
+        if callable(refresh):
+            refresh()
+
+    def _reset_tile_rack_image_corner_selection(self) -> None:
+        self._tile_rack_corner_selection_points = []
+        for value_var in getattr(self, "_tile_rack_image_corner_value_vars", []):
+            value_var.set("not selected")
+        if hasattr(self, "_tile_rack_corner_status_var"):
+            self._tile_rack_corner_status_var.set("Next: top-left")
+        self.tile_rack_status_var.set("Click top-left tile rack corner in the calibration image.")
+        self._set_status("Click top-left tile rack corner in the calibration image.")
+        self._refresh_tile_rack_corner_window_image()
+
+    def _refresh_tile_rack_corner_window_image(self) -> None:
+        frame = getattr(self, "_tile_rack_corner_image_frame", None)
+        label = getattr(self, "_tile_rack_corner_image_label", None)
+        if frame is None or label is None:
+            return
+
+        cv2 = _require_cv2()
+        display = self._draw_tile_rack_pending_corner_overlay(frame.copy())
+        points = list(getattr(self, "_tile_rack_corner_selection_points", []))
+        if len(points) == 4:
+            display = self._draw_tile_rack_corner_grid_overlay(display, points)
+        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        from PIL import Image, ImageTk
+
+        image = Image.fromarray(rgb)
+        image.thumbnail((760, 560))
+        self._tile_rack_corner_display_size = image.size
+        self._tile_rack_corner_photo = ImageTk.PhotoImage(image)
+        label.configure(image=self._tile_rack_corner_photo)
+
+    def _open_tile_rack_corner_window(self, corners, source: str) -> None:  # type: ignore[no-untyped-def]
+        window = tk.Toplevel(self.root)
+        self._tile_rack_corner_window = window
+        window.title("Calibrate Tile Rack")
+        window.resizable(False, False)
+        window.columnconfigure(1, weight=1)
+        window.columnconfigure(2, weight=1)
+
+        ttk.Label(window, text="Corner").grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        ttk.Label(window, text="X").grid(row=0, column=1, sticky="w", padx=6, pady=(10, 4))
+        ttk.Label(window, text="Y").grid(row=0, column=2, sticky="w", padx=6, pady=(10, 4))
+
+        labels = ("Top left", "Top right", "Bottom right", "Bottom left")
+        self._tile_rack_corner_vars = []
+        for index, label in enumerate(labels):
+            x, y = corners[index]
+            x_var = tk.StringVar(value=f"{float(x):.0f}")
+            y_var = tk.StringVar(value=f"{float(y):.0f}")
+            self._tile_rack_corner_vars.append((x_var, y_var))
+            ttk.Label(window, text=label).grid(row=index + 1, column=0, sticky="w", padx=10, pady=3)
+            ttk.Entry(window, textvariable=x_var, width=8).grid(row=index + 1, column=1, sticky="ew", padx=6, pady=3)
+            ttk.Entry(window, textvariable=y_var, width=8).grid(row=index + 1, column=2, sticky="ew", padx=6, pady=3)
+
+        ttk.Button(window, text="Apply Tile Rack Corners", command=self._apply_tile_rack_corner_calibration).grid(
+            row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=(8, 4)
+        )
+        ttk.Button(window, text="Use Other Side Default", command=self._set_tile_rack_other_side_default_corners).grid(
+            row=6, column=0, columnspan=3, sticky="ew", padx=10, pady=4
+        )
+        ttk.Button(window, text="Use Brown Rack Detection", command=self._set_tile_rack_detected_corners).grid(
+            row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=4
+        )
+        ttk.Label(window, text=f"Source: {source}", wraplength=260).grid(
+            row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 10)
+        )
+
+    def _apply_tile_rack_corner_calibration(self) -> None:
+        try:
+            corners = []
+            for x_var, y_var in self._tile_rack_corner_vars:
+                corners.append((float(x_var.get()), float(y_var.get())))
+            if len(corners) != 4:
+                raise ValueError("Give all four tile rack corners.")
+
+            self._tile_rack_calibrated_corners = corners
+            self._tile_rack_calibrated_rect = None
+            self._last_tile_rack_camera_rect = None
+            self.tile_rack_status_var.set("Tile rack corners calibrated. Rack grid adjusted to the given corners.")
+            self._set_status("Tile rack corners calibrated.")
+            self._log(f"Tile rack corner calibration: {corners}")
+            refresh = getattr(self, "_refresh_camera_preview", None)
+            if callable(refresh):
+                refresh()
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _set_tile_rack_other_side_default_corners(self) -> None:
+        try:
+            frame = getattr(self, "_captured_photo_frame", None)
+            if frame is None:
+                frame, _quality = self._capture_best_photo_for_ocr("tile rack side default")
+            height, width = frame.shape[:2]
+
+            current = self._read_tile_rack_corner_values()
+            current_center_x = sum(point[0] for point in current) / 4.0 if current else width * 0.2
+            rack_width = max(30.0, abs(current[1][0] - current[0][0]) if current else width * 0.08)
+            rack_height = max(120.0, abs(current[3][1] - current[0][1]) if current else height * 0.65)
+            margin_x = max(5.0, width * 0.03)
+            margin_y = max(5.0, height * 0.15)
+
+            if current_center_x < width / 2.0:
+                x = width - margin_x - rack_width
+            else:
+                x = margin_x
+            y = margin_y
+            self._write_tile_rack_corner_values(
+                [
+                    (x, y),
+                    (x + rack_width, y),
+                    (x + rack_width, y + rack_height),
+                    (x, y + rack_height),
+                ]
+            )
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _set_tile_rack_detected_corners(self) -> None:
+        try:
+            frame = getattr(self, "_captured_photo_frame", None)
+            if frame is None:
+                frame, _quality = self._capture_best_photo_for_ocr("tile rack brown detection")
+            rect = self._detect_tile_rack_brown_rect(frame)
+            if rect is None:
+                raise ValueError("Could not find the brown tile rack area clearly.")
+            x, y, width, height = rect
+            self._write_tile_rack_corner_values(
+                [
+                    (x, y),
+                    (x + width, y),
+                    (x + width, y + height),
+                    (x, y + height),
+                ]
+            )
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _read_tile_rack_corner_values(self) -> list[tuple[float, float]]:
+        corners = []
+        for x_var, y_var in getattr(self, "_tile_rack_corner_vars", []):
+            corners.append((float(x_var.get()), float(y_var.get())))
+        return corners
+
+    def _write_tile_rack_corner_values(self, corners) -> None:  # type: ignore[no-untyped-def]
+        for index, (x, y) in enumerate(corners):
+            x_var, y_var = self._tile_rack_corner_vars[index]
+            x_var.set(f"{float(x):.0f}")
+            y_var.set(f"{float(y):.0f}")
+
+    def _build_tile_rack_letter_grid(self, parent) -> None:  # type: ignore[no-untyped-def]
+        self._ensure_tile_rack_move_state()
+        for index, variable in enumerate(self.tile_rack_letter_vars):
+            ttk.Label(parent, text=f"TR{index + 1}").grid(row=index, column=0, sticky="e", padx=(6, 4), pady=1)
+            entry = ttk.Entry(parent, textvariable=variable, width=4, justify="center")
+            entry.grid(row=index, column=1, sticky="w", padx=(0, 6), pady=1)
+            entry.configure(state="readonly")
+
+    def suggest_tile_rack_words(self) -> None:
+        self._ensure_tile_rack_move_state()
+        try:
+            rack_letters = self._tile_rack_letters_for_word_suggestions()
+            if len(rack_letters) < 2:
+                raise ValueError("Detect or enter at least 2 tile rack letters first.")
+
+            words = self._tile_rack_words_from_letters(rack_letters)
+            if not words:
+                message = f"No words found from rack letters: {''.join(rack_letters)}"
+                self.tile_rack_word_suggestions_var.set(message)
+                self._set_status(message)
+                return
+
+            shown_words = words[:80]
+            display = "\n".join(
+                f"{index + 1}. {word} ({len(word)} letters, {self._scrabble_word_score(word)} pts)"
+                for index, word in enumerate(shown_words)
+            )
+            if len(words) > len(shown_words):
+                display += f"\n... {len(words) - len(shown_words)} more"
+            self.tile_rack_word_suggestions_var.set(display)
+            self._set_status(f"Suggested {len(words)} word(s) from rack letters: {''.join(rack_letters)}.")
+            self._log("Tile rack word suggestions:\n" + display)
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _tile_rack_letters_for_word_suggestions(self) -> list[str]:
+        letters: list[str] = []
+        for variable in getattr(self, "tile_rack_letter_vars", []):
+            try:
+                value = variable.get()
+            except Exception:
+                value = ""
+            for character in str(value).upper():
+                if character.isalpha():
+                    letters.append(character)
+                    break
+        return letters[:7]
+
+    def _tile_rack_words_from_letters(self, rack_letters: list[str]) -> list[str]:
+        from collections import Counter
+
+        available = Counter(letter.upper() for letter in rack_letters if letter.isalpha())
+        words = []
+        seen = set()
+        for word in self._tile_rack_candidate_words():
+            normalized = "".join(character for character in str(word).upper() if character.isalpha())
+            if len(normalized) < 2 or len(normalized) > len(rack_letters) or normalized in seen:
+                continue
+            needed = Counter(normalized)
+            if all(needed[letter] <= available[letter] for letter in needed):
+                seen.add(normalized)
+                words.append(normalized)
+
+        return sorted(words, key=lambda word: (-len(word), -self._scrabble_word_score(word), word))
+
+    def _tile_rack_candidate_words(self) -> list[str]:
+        cached = getattr(self, "_tile_rack_candidate_word_cache", None)
+        if cached is not None:
+            return cached
+
+        words = self._tile_rack_candidate_words_from_modules()
+        if not words:
+            words = self._tile_rack_candidate_words_from_files()
+        if not words:
+            words = self._fallback_tile_rack_words()
+
+        self._tile_rack_candidate_word_cache = words
+        return words
+
+    def _tile_rack_candidate_words_from_modules(self) -> list[str]:
+        import importlib
+
+        module_names = (
+            "scrabble_plotter.words",
+            "scrabble_plotter.dictionary",
+            "scrabble_plotter.scoring",
+            "scrabble_plotter.solver",
+            "scrabble_plotter.word_finder",
+        )
+        attribute_names = (
+            "VALID_WORDS",
+            "WORDS",
+            "WORD_LIST",
+            "DICTIONARY",
+            "SCRABBLE_WORDS",
+            "COMMON_WORDS",
+        )
+        for module_name in module_names:
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                continue
+            for attribute_name in attribute_names:
+                values = getattr(module, attribute_name, None)
+                if values:
+                    try:
+                        return list(values)
+                    except Exception:
+                        continue
+        return []
+
+    def _tile_rack_candidate_words_from_files(self) -> list[str]:
+        from pathlib import Path
+
+        names = (
+            "words.txt",
+            "wordlist.txt",
+            "word_list.txt",
+            "dictionary.txt",
+            "scrabble_words.txt",
+            "sowpods.txt",
+            "twl.txt",
+            "twl06.txt",
+            "enable1.txt",
+        )
+        roots = []
+        try:
+            package_root = Path(__file__).resolve().parent
+            roots.extend([package_root, package_root.parent, package_root / "data", package_root.parent / "data"])
+        except Exception:
+            pass
+        try:
+            roots.append(Path.cwd())
+        except Exception:
+            pass
+
+        for root in roots:
+            for name in names:
+                path = root / name
+                if not path.exists() or not path.is_file():
+                    continue
+                try:
+                    words = [
+                        line.strip().upper()
+                        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                        if line.strip()
+                    ]
+                except Exception:
+                    continue
+                if words:
+                    return words
+        return []
+
+    def _scrabble_word_score(self, word: str) -> int:
+        scores = {
+            "A": 1,
+            "E": 1,
+            "I": 1,
+            "O": 1,
+            "U": 1,
+            "L": 1,
+            "N": 1,
+            "S": 1,
+            "T": 1,
+            "R": 1,
+            "D": 2,
+            "G": 2,
+            "B": 3,
+            "C": 3,
+            "M": 3,
+            "P": 3,
+            "F": 4,
+            "H": 4,
+            "V": 4,
+            "W": 4,
+            "Y": 4,
+            "K": 5,
+            "J": 8,
+            "X": 8,
+            "Q": 10,
+            "Z": 10,
+        }
+        return sum(scores.get(character.upper(), 0) for character in word)
+
+    def _fallback_tile_rack_words(self) -> list[str]:
+        return """
+        A AN AM AS AT BE BY DO GO HE HI IF IN IS IT ME MY NO OF OH ON OR OX SO TO UP US WE
+        ACE ACT ADD AGE AGO AID AIM AIR ALE ALL AND ANT ANY APE ARC ARE ARM ART ASH ASK ATE
+        BAD BAG BAN BAR BAT BAY BED BEE BET BID BIG BIN BIT BOB BOG BOW BOX BOY BUD BUG BUN
+        BUS BUT BUY CAB CAD CAM CAN CAP CAR CAT COB COD COG CON COP COT COW COY CUB CUE CUP
+        CUT DAB DAD DAM DAY DEN DID DIE DIG DIM DIN DIP DOG DOT DRY DUE DUG EAR EAT EGG EGO
+        ELF END ERA FAR FAT FED FEE FEN FEW FIG FIN FIR FIT FIX FLY FOG FOR FOX FRY FUN FUR
+        GAP GAS GEL GET GIN GOD GOT GUM GUN GUY HAD HAM HAS HAT HAY HEN HER HIM HIP HIS HIT
+        HOP HOT HOW HUG HUT ICE ILL INK JAM JAR JAW JET JOB JOG JOY KEY KID KIN KIT LAB LAD
+        LAG LAP LAW LAY LED LEG LET LID LIE LIP LOG LOT LOW MAD MAN MAP MAT MAY MEN MET MIX
+        MOM MUD MUG NAP NET NEW NOD NOR NOT NOW NUT OAK OAR ODD OFF OLD ONE OUR OUT OWL PAD
+        PAL PAN PAR PAT PAW PAY PEA PEN PET PIE PIN PIT POD POP POT RAG RAM RAN RAT RAW RAY
+        RED RID RIG RIP ROB ROD ROT ROW RUB RUG RUN SAD SAG SAT SAW SAY SEA SEE SET SHE SHY
+        SIN SIP SIR SIT SIX SKY SLY SON SUN TAB TAG TAN TAP TAR TAX TEA TEN THE TIE TIN TOE
+        TON TOP TOY TRY TUB TWO USE VAN VAT VET VIA WAR WAS WAY WEB WET WHO WHY WIN WIT WON
+        YES YET YOU ZAP ZIP ZOO
+        ABLE ACID ACRE ACTS AGES AIMS AIRS ALSO AREA ARMS ARMY ARTS BACK BAGS BAKE BALL BAND
+        BARE BARK BARN BASE BATH BEAD BEAM BEAN BEAR BEAT BEND BEST BIRD BITE BOAT BOLD BONE
+        BOOK BORN BOWL CAFE CAGE CAKE CALL CALM CAME CAMP CARD CARE CART CASE CASH CAST CATS
+        CHAT CLAY COAL COAT CODE COLD COME COOK COOL CORD CORE COST CUBE CURE DARK DATE DAWN
+        DAYS DEAL DEAR DECK DEEP DICE DIRT DOOR DOWN DRAW DROP DUST EACH EARN EAST EASY ECHO
+        EDGE FAIR FALL FARM FAST FEAR FEED FEEL FILE FILL FILM FIND FINE FIRE FISH FIVE FLAG
+        FLAT FLOW FOOD FOOT FORM FOUR FREE FROM GAME GATE GEAR GIFT GIRL GIVE GOAL GOLD GOOD
+        GRAY GROW HAIR HALF HAND HARD HARM HATE HAVE HEAD HEAR HEAT HELP HILL HOLD HOME HOPE
+        HOUR IDEA INTO IRON JACK JOIN JUMP KEEP KIND KING KITE LACE LACK LADY LAKE LAND LANE
+        LAST LATE LEAD LEAF LEFT LEND LIFE LINE LINK LIST LIVE LOAD LOCK LONG LOOK LORD LOVE
+        MADE MAIL MAIN MAKE MANY MARK MATE MEAL MEAN MEET MILE MILK MIND MINE MINT MOON MORE
+        MOST MOVE NAME NEAR NEED NEST NICE NINE NOTE OPEN OVER PACK PAGE PAID PAIR PARK PART
+        PAST PATH PEAK PEAR PICK PILE PINK PLAN PLAY PLOT PLUS POEM POND POOL PORT POST PULL
+        PUSH RACE RAIN READ REAL REST RICE RIDE RING ROAD ROCK ROLE ROPE ROSE RULE SAND SAVE
+        SEAT SEED SEEN SELF SEND SHIP SHOP SIDE SIGN SING SINK SITE SLOW SNOW SOFT SOLD SOME
+        SONG SOON SORT STAR STAY STEP STOP SUCH SUIT SURE TAKE TALE TALL TAPE TEAM TELL TEND
+        TENT THAN THAT THEM THEN THEY THIN THIS TIME TONE TOOL TREE TRIP TRUE TURN UNIT UPON
+        USED USER VAST VERY VIEW WALK WALL WANT WARM WASH WAVE WEAK WEAR WEEK WELL WENT WERE
+        WEST WHAT WHEN WILL WIND WING WIRE WISE WITH WORD WORK YARD YEAR
+        ABOUT ABOVE ACTOR AFTER AGAIN AGREE ALARM ALIVE ALLOW ALONE AMONG ANGLE APPLE APPLY
+        BASIC BEACH BEGIN BLACK BOARD BRAIN BREAD BRING BROWN BUILD CHAIR CHARM CHECK CLEAN
+        CLEAR CLOSE CLOUD COAST COUNT COVER CREAM CROSS DANCE DREAM DRINK EARLY EARTH EMPTY
+        ENTER FIELD FIRST FLOOR FOUND FRAME FRESH FRONT FRUIT GLASS GRASS GREAT GREEN GROUP
+        GUARD GUESS HAPPY HEART HEAVY HOUSE HUMAN IMAGE LARGE LATER LAUGH LEARN LIGHT LOCAL
+        MAGIC MAJOR MARCH MATCH MONEY MONTH MUSIC NEVER NIGHT NORTH OCEAN OTHER PAPER PARTY
+        PEACE PHONE PIECE PLACE PLAIN PLANT POINT POWER PRESS PRICE QUICK RADIO READY RIGHT
+        RIVER ROUND SCALE SCORE SHARE SHORT SMALL SMART SOUND SOUTH SPACE SPEAK SPEED SPELL
+        SPEND SPORT STAND START STATE STONE STORE STORY SWEET TABLE TEACH THANK THEIR THERE
+        THING THINK THREE TODAY TOTAL TOUCH TRAIN UNDER UNTIL VALUE VIDEO VISIT VOICE WATER
+        WHERE WHITE WHOLE WORLD WRITE YOUNG
+        """.split()
+
+    def capture_tile_rack_letters(self) -> None:
+        self._ensure_tile_rack_move_state()
+        try:
+            live_frame = getattr(self, "_last_displayed_camera_frame_for_ocr", None)
+            if live_frame is None:
+                live_frame = getattr(self, "_latest_frame", None)
+            if live_frame is not None:
+                frame = live_frame.copy()
+                source = "live camera"
+            else:
+                frame, quality = self._capture_best_photo_for_ocr("tile rack letters")
+                source = f"best live camera frame, sharpness {quality.sharpness:.0f}"
+
+            scan = scan_camera_letters(frame)
+            letters = self._tile_rack_letters_from_camera(frame, scan)
+            detected_count = 0
+            lines = []
+            for index, variable in enumerate(self.tile_rack_letter_vars):
+                letter = letters[index] if index < len(letters) else ""
+                variable.set(letter)
+                if letter:
+                    detected_count += 1
+                x, y = self._tile_rack_slot_position(index)
+                lines.append(f"TR{index + 1}: {letter or '-'}  X{x:g} Y{y:g}")
+
+            result = "\n".join(lines)
+            self.tile_rack_status_var.set(result)
+            self._set_status(f"Captured {detected_count} tile rack letter(s) from the {source}.")
+            self._log("Tile rack letters:\n" + result)
+            refresh = getattr(self, "_refresh_camera_preview", None)
+            if callable(refresh):
+                refresh()
+        except Exception as exc:
+            self._show_error(exc)
+
+    def _update_tile_rack_letters_from_scan(self, frame, scan, source: str = "camera OCR") -> int:  # type: ignore[no-untyped-def]
+        self._ensure_tile_rack_move_state()
+        corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        if not corners or len(corners) != 4:
+            return 0
+
+        letters = self._tile_rack_letters_from_camera(frame, scan)
+        detected_count = 0
+        lines = []
+        for index, variable in enumerate(self.tile_rack_letter_vars):
+            letter = letters[index] if index < len(letters) else ""
+            variable.set(letter)
+            if letter:
+                detected_count += 1
+            x, y = self._tile_rack_slot_position(index)
+            lines.append(f"TR{index + 1}: {letter or '-'}  X{x:g} Y{y:g}")
+
+        result = "\n".join(lines)
+        self.tile_rack_status_var.set(result)
+        self._log(f"Tile rack letters from {source}:\n" + result)
+        refresh = getattr(self, "_refresh_camera_preview", None)
+        if callable(refresh):
+            refresh()
+        return detected_count
+
+    def _has_calibrated_tile_rack_grid(self) -> bool:
+        corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        return bool(corners and len(corners) == 4)
+
+    def _clear_tile_rack_side_from_main_ocr_grid(self) -> None:
+        if not self._has_calibrated_tile_rack_grid():
+            return
+
+        entries = getattr(self, "_letter_entries", None)
+        if not entries:
+            return
+
+        rack_corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        rack_x_values = [float(point[0]) for point in rack_corners]
+        rack_y_values = [float(point[1]) for point in rack_corners]
+        rack_center_x = sum(rack_x_values) / len(rack_x_values)
+        rack_top = min(rack_y_values)
+        rack_bottom = max(rack_y_values)
+
+        grid = None
+        try:
+            grid = self._current_camera_ocr_grid()
+        except Exception:
+            grid = None
+
+        grid_corners = getattr(grid, "corners", None)
+        if grid_corners and len(grid_corners) == 4:
+            grid_x_values = [float(point[0]) for point in grid_corners]
+            grid_center_x = sum(grid_x_values) / len(grid_x_values)
+            rack_column = 0 if rack_center_x < grid_center_x else BOARD_SIZE - 1
+            top_left, top_right, bottom_right, bottom_left = [
+                (float(point[0]), float(point[1])) for point in grid_corners
+            ]
+            top_edge = top_left if rack_column == 0 else top_right
+            bottom_edge = bottom_left if rack_column == 0 else bottom_right
+            for row in range(min(BOARD_SIZE, len(entries))):
+                row_amount = (row + 0.5) / BOARD_SIZE
+                row_y = top_edge[1] + row_amount * (bottom_edge[1] - top_edge[1])
+                if rack_top - 8.0 <= row_y <= rack_bottom + 8.0:
+                    self._clear_main_ocr_entry(row, rack_column)
+            return
+
+        frame = self._current_camera_ocr_frame()
+        frame_width = frame.shape[1] if frame is not None else 0
+        rack_column = 0 if frame_width <= 0 or rack_center_x < frame_width / 2.0 else BOARD_SIZE - 1
+        rack_letters = {
+            variable.get().strip().upper()
+            for variable in getattr(self, "tile_rack_letter_vars", [])
+            if variable.get().strip()
+        }
+        for row in range(min(BOARD_SIZE, len(entries))):
+            try:
+                text = entries[row][rack_column].get().strip().upper()
+            except Exception:
+                text = ""
+            if not rack_letters or text in rack_letters:
+                self._clear_main_ocr_entry(row, rack_column)
+
+    def _clear_main_ocr_entry(self, row: int, col: int) -> None:
+        try:
+            entry = self._letter_entries[row][col]
+        except Exception:
+            return
+        try:
+            old_state = str(entry.cget("state"))
+        except Exception:
+            old_state = ""
+        try:
+            if old_state == "readonly":
+                entry.configure(state="normal")
+            entry.delete(0, tk.END)
+        finally:
+            if old_state == "readonly":
+                entry.configure(state=old_state)
+
+    def _separate_grid_from_tile_rack(self, grid) -> None:  # type: ignore[no-untyped-def]
+        if not self._has_calibrated_tile_rack_grid():
+            return
+
+        grid_corners = getattr(grid, "corners", None)
+        rack_corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        if not grid_corners or len(grid_corners) != 4 or not rack_corners or len(rack_corners) != 4:
+            return
+
+        rack_x_values = [float(point[0]) for point in rack_corners]
+        grid_x_values = [float(point[0]) for point in grid_corners]
+        rack_center_x = sum(rack_x_values) / len(rack_x_values)
+        grid_center_x = sum(grid_x_values) / len(grid_x_values)
+        rack_width = max(rack_x_values) - min(rack_x_values)
+        white_strip_gap = max(10.0, rack_width * 0.15)
+
+        top_left, top_right, bottom_right, bottom_left = [
+            (float(point[0]), float(point[1])) for point in grid_corners
+        ]
+
+        if rack_center_x < grid_center_x:
+            boundary_x = max(rack_x_values) + white_strip_gap
+            if boundary_x <= min(grid_x_values) or boundary_x >= max(grid_x_values):
+                return
+            new_top_left = self._point_on_segment_at_x(top_left, top_right, boundary_x)
+            new_bottom_left = self._point_on_segment_at_x(bottom_left, bottom_right, boundary_x)
+            new_corners = [new_top_left, top_right, bottom_right, new_bottom_left]
+        else:
+            boundary_x = min(rack_x_values) - white_strip_gap
+            if boundary_x <= min(grid_x_values) or boundary_x >= max(grid_x_values):
+                return
+            new_top_right = self._point_on_segment_at_x(top_left, top_right, boundary_x)
+            new_bottom_right = self._point_on_segment_at_x(bottom_left, bottom_right, boundary_x)
+            new_corners = [top_left, new_top_right, new_bottom_right, bottom_left]
+
+        self._set_grid_corners(grid, new_corners)
+
+    def _separate_main_grid_from_tile_rack(self, scan) -> None:  # type: ignore[no-untyped-def]
+        if not self._has_calibrated_tile_rack_grid():
+            return
+
+        grid = getattr(scan, "grid", None)
+        grid_corners = getattr(grid, "corners", None)
+        rack_corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        if grid is None or not grid_corners or len(grid_corners) != 4 or not rack_corners or len(rack_corners) != 4:
+            return
+
+        rack_x_values = [float(point[0]) for point in rack_corners]
+        grid_x_values = [float(point[0]) for point in grid_corners]
+        rack_center_x = sum(rack_x_values) / len(rack_x_values)
+        grid_center_x = sum(grid_x_values) / len(grid_x_values)
+        rack_width = max(rack_x_values) - min(rack_x_values)
+        white_strip_gap = max(10.0, rack_width * 0.15)
+
+        top_left, top_right, bottom_right, bottom_left = [
+            (float(point[0]), float(point[1])) for point in grid_corners
+        ]
+
+        if rack_center_x < grid_center_x:
+            boundary_x = max(rack_x_values) + white_strip_gap
+            if boundary_x <= min(grid_x_values) or boundary_x >= max(grid_x_values):
+                return
+            new_top_left = self._point_on_segment_at_x(top_left, top_right, boundary_x)
+            new_bottom_left = self._point_on_segment_at_x(bottom_left, bottom_right, boundary_x)
+            new_corners = [new_top_left, top_right, bottom_right, new_bottom_left]
+        else:
+            boundary_x = min(rack_x_values) - white_strip_gap
+            if boundary_x <= min(grid_x_values) or boundary_x >= max(grid_x_values):
+                return
+            new_top_right = self._point_on_segment_at_x(top_left, top_right, boundary_x)
+            new_bottom_right = self._point_on_segment_at_x(bottom_left, bottom_right, boundary_x)
+            new_corners = [top_left, new_top_right, new_bottom_right, bottom_left]
+
+        self._set_grid_corners(grid, new_corners)
+
+    def _point_on_segment_at_x(
+        self,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        x_value: float,
+    ) -> list[float]:
+        start_x, start_y = start
+        end_x, end_y = end
+        if abs(end_x - start_x) < 1e-6:
+            return [float(x_value), float(start_y)]
+        amount = (float(x_value) - start_x) / (end_x - start_x)
+        amount = max(0.0, min(1.0, amount))
+        return [float(x_value), start_y + amount * (end_y - start_y)]
+
+    def _set_grid_corners(self, grid, corners) -> None:  # type: ignore[no-untyped-def]
+        normalized = [[float(x), float(y)] for x, y in corners]
+        try:
+            grid.corners = normalized
+            return
+        except Exception:
+            pass
+        try:
+            current = getattr(grid, "corners", None)
+            if current is not None:
+                current[:] = normalized
+        except Exception:
+            pass
+
+    def _frame_without_tile_rack_area(self, frame):  # type: ignore[no-untyped-def]
+        if not self._has_calibrated_tile_rack_grid():
+            return frame
+        try:
+            cv2 = _require_cv2()
+            import numpy as np
+        except Exception:
+            return frame
+
+        corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        masked = frame.copy()
+        polygon = np.array([[int(round(float(x))), int(round(float(y)))] for x, y in corners], dtype=np.int32)
+        if len(masked.shape) == 3:
+            fill_value = tuple(int(value) for value in np.median(masked.reshape(-1, masked.shape[2]), axis=0))
+        else:
+            fill_value = int(np.median(masked))
+        cv2.fillConvexPoly(masked, polygon, fill_value)
+        return masked
+
+    def _restore_tile_rack_area_from_frame(self, display, clean_frame):  # type: ignore[no-untyped-def]
+        if not self._has_calibrated_tile_rack_grid():
+            return display
+        try:
+            cv2 = _require_cv2()
+            import numpy as np
+        except Exception:
+            return display
+
+        corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        if display.shape[:2] != clean_frame.shape[:2]:
+            return display
+        polygon = np.array([[int(round(float(x))), int(round(float(y)))] for x, y in corners], dtype=np.int32)
+        mask = np.zeros(display.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, polygon, 255)
+        restored = display.copy()
+        restored[mask > 0] = clean_frame[mask > 0]
+        return restored
+
+    def _tile_rack_letters_from_camera(self, frame, scan) -> list[str]:  # type: ignore[no-untyped-def]
+        letters = [""] * 7
+        corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        if corners and len(corners) == 4:
+            for item in self._tile_rack_camera_items(scan):
+                center = self._tile_rack_camera_item_center(item)
+                if center is None:
+                    continue
+                slot_index = self._tile_rack_slot_index_from_camera_corners(corners, center[0], center[1])
+                if slot_index is None or letters[slot_index]:
+                    continue
+                letter = self._tile_rack_camera_item_letter(item)
+                if letter:
+                    letters[slot_index] = letter
+            return letters
+
+        rect = getattr(self, "_tile_rack_calibrated_rect", None) or getattr(self, "_last_tile_rack_camera_rect", None)
+        if rect is None:
+            rect = self._detect_tile_rack_brown_rect(frame)
+        if rect is not None:
+            self._last_tile_rack_camera_rect = rect
+        if rect is not None:
+            for item in self._tile_rack_camera_items(scan):
+                center = self._tile_rack_camera_item_center(item)
+                if center is None:
+                    continue
+                slot_index = self._tile_rack_slot_index_from_camera_point(rect, center[0], center[1])
+                if slot_index is None or letters[slot_index]:
+                    continue
+                letter = self._tile_rack_camera_item_letter(item)
+                if letter:
+                    letters[slot_index] = letter
+            if any(letters):
+                return letters
+
+        fallback = []
+        for item in sorted(self._tile_rack_camera_items(scan), key=self._tile_rack_camera_sort_key):
+            letter = self._tile_rack_camera_item_letter(item)
+            if letter:
+                fallback.append(letter)
+            if len(fallback) >= 7:
+                break
+        for index, letter in enumerate(fallback[:7]):
+            letters[index] = letter
+        return letters
+
+    def _tile_rack_camera_items(self, scan) -> list[object]:  # type: ignore[no-untyped-def]
+        items: list[object] = []
+        for name in ("letters", "tiles", "text_boxes"):
+            values = getattr(scan, name, None)
+            if values:
+                items.extend(list(values))
+        return items
+
+    def _tile_rack_camera_item_letter(self, item) -> str:  # type: ignore[no-untyped-def]
+        for name in ("text", "letter"):
+            value = getattr(item, name, None)
+            if not value:
+                continue
+            for character in str(value).upper():
+                if character.isalpha():
+                    return character
+        return ""
+
+    def _tile_rack_camera_sort_key(self, item) -> tuple[float, float]:  # type: ignore[no-untyped-def]
+        center = self._tile_rack_camera_item_center(item)
+        if center is None:
+            return (0.0, 0.0)
+        return (center[1], center[0])
+
+    def _tile_rack_camera_item_center(self, item) -> tuple[float, float] | None:  # type: ignore[no-untyped-def]
+        center_x = getattr(item, "center_x", None)
+        center_y = getattr(item, "center_y", None)
+        if center_x is not None and center_y is not None:
+            return float(center_x), float(center_y)
+
+        left = getattr(item, "left", None)
+        top = getattr(item, "top", None)
+        if left is not None and top is not None:
+            width = getattr(item, "width", 0) or 0
+            height = getattr(item, "height", 0) or 0
+            return float(left) + float(width) / 2.0, float(top) + float(height) / 2.0
+
+        points = getattr(item, "points", None) or getattr(item, "corners", None)
+        if points:
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+            return sum(xs) / len(xs), sum(ys) / len(ys)
+        return None
+
+    def _detect_tile_rack_brown_rect(self, frame):  # type: ignore[no-untyped-def]
+        try:
+            cv2 = _require_cv2()
+            import numpy as np
+        except Exception:
+            return None
+
+        if len(frame.shape) == 3:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        else:
+            hsv = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2HSV)
+
+        lower_brown = np.array([5, 35, 25], dtype=np.uint8)
+        upper_brown = np.array([35, 255, 215], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_brown, upper_brown)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        frame_area = float(frame.shape[0] * frame.shape[1])
+        best_rect = None
+        best_score = 0.0
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            area = float(width * height)
+            if area < frame_area * 0.001:
+                continue
+            if height < width * 1.4:
+                continue
+            score = area * (height / max(width, 1))
+            if score > best_score:
+                best_rect = (int(x), int(y), int(width), int(height))
+                best_score = score
+        return best_rect
+
+    def _draw_tile_rack_grid_overlay(self, frame):  # type: ignore[no-untyped-def]
+        try:
+            cv2 = _require_cv2()
+        except Exception:
+            return frame
+
+        if getattr(self, "_tile_rack_corner_selection_active", False):
+            return self._draw_tile_rack_pending_corner_overlay(frame)
+
+        corners = getattr(self, "_tile_rack_calibrated_corners", None)
+        if corners and len(corners) == 4:
+            return self._draw_tile_rack_corner_grid_overlay(frame, corners)
+
+        rect = getattr(self, "_tile_rack_calibrated_rect", None) or getattr(self, "_last_tile_rack_camera_rect", None)
+        if rect is None:
+            rect = self._detect_tile_rack_brown_rect(frame)
+        if rect is None:
+            return frame
+
+        self._last_tile_rack_camera_rect = rect
+        x, y, width, height = rect
+        green = (0, 255, 0)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x, y), (x + width, y + height), green, 3, cv2.LINE_AA)
+        for index in range(1, 7):
+            line_y = int(round(y + height * index / 7.0))
+            cv2.line(overlay, (x, line_y), (x + width, line_y), green, 2, cv2.LINE_AA)
+
+        if hasattr(self, "tile_rack_letter_vars"):
+            for index, variable in enumerate(self.tile_rack_letter_vars):
+                try:
+                    letter = variable.get()
+                except Exception:
+                    letter = ""
+                if not letter:
+                    continue
+                center_y = int(round(y + height * (index + 0.5) / 7.0))
+                cv2.putText(
+                    overlay,
+                    str(letter).upper()[:1],
+                    (x + max(6, width // 2 - 10), center_y + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    green,
+                    2,
+                    cv2.LINE_AA,
+                )
+        return overlay
+
+    def _draw_tile_rack_pending_corner_overlay(self, frame):  # type: ignore[no-untyped-def]
+        try:
+            cv2 = _require_cv2()
+        except Exception:
+            return frame
+
+        points = list(getattr(self, "_tile_rack_corner_selection_points", []))
+        if not points:
+            return frame
+
+        overlay = frame.copy()
+        green = (0, 255, 0)
+        for index, point in enumerate(points):
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            cv2.circle(overlay, (x, y), 6, green, -1, cv2.LINE_AA)
+            cv2.putText(
+                overlay,
+                str(index + 1),
+                (x + 8, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                green,
+                2,
+                cv2.LINE_AA,
+            )
+            if index > 0:
+                previous = points[index - 1]
+                cv2.line(
+                    overlay,
+                    (int(round(float(previous[0]))), int(round(float(previous[1])))),
+                    (x, y),
+                    green,
+                    2,
+                    cv2.LINE_AA,
+                )
+        return overlay
+
+    def _draw_board_pending_corner_overlay(self, frame):  # type: ignore[no-untyped-def]
+        if not getattr(self, "_board_corner_selection_active", False):
+            return frame
+        try:
+            cv2 = _require_cv2()
+        except Exception:
+            return frame
+
+        points = list(getattr(self, "_board_corner_selection_points", []))
+        if not points:
+            return frame
+
+        overlay = frame.copy()
+        color = (255, 0, 255)
+        for index, point in enumerate(points):
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            cv2.circle(overlay, (x, y), 7, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                overlay,
+                str(index + 1),
+                (x + 9, y - 9),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+            if index > 0:
+                previous = points[index - 1]
+                cv2.line(
+                    overlay,
+                    (int(round(float(previous[0]))), int(round(float(previous[1])))),
+                    (x, y),
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+        return overlay
+
+    def _draw_tile_rack_corner_grid_overlay(self, frame, corners):  # type: ignore[no-untyped-def]
+        try:
+            cv2 = _require_cv2()
+            import numpy as np
+        except Exception:
+            return frame
+
+        overlay = frame.copy()
+        green = (0, 255, 0)
+        source = np.array([(0.0, 0.0), (1.0, 0.0), (1.0, 7.0), (0.0, 7.0)], dtype=np.float32)
+        destination = np.array(corners, dtype=np.float32)
+        transform = cv2.getPerspectiveTransform(source, destination)
+
+        def project(point):  # type: ignore[no-untyped-def]
+            mapped = cv2.perspectiveTransform(np.array([[point]], dtype=np.float32), transform)[0][0]
+            return int(round(float(mapped[0]))), int(round(float(mapped[1])))
+
+        outline = [project(point) for point in [(0.0, 0.0), (1.0, 0.0), (1.0, 7.0), (0.0, 7.0)]]
+        for index, point in enumerate(outline):
+            cv2.line(overlay, point, outline[(index + 1) % 4], green, 3, cv2.LINE_AA)
+
+        for index in range(1, 7):
+            left = project((0.0, float(index)))
+            right = project((1.0, float(index)))
+            cv2.line(overlay, left, right, green, 2, cv2.LINE_AA)
+
+        if hasattr(self, "tile_rack_letter_vars"):
+            for index, variable in enumerate(self.tile_rack_letter_vars):
+                try:
+                    letter = variable.get()
+                except Exception:
+                    letter = ""
+                if not letter:
+                    continue
+                letter_point = project((0.45, index + 0.5))
+                cv2.putText(
+                    overlay,
+                    str(letter).upper()[:1],
+                    letter_point,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    green,
+                    2,
+                    cv2.LINE_AA,
+                )
+        return overlay
+
+    def _tile_rack_slot_index_from_camera_corners(self, corners, x: float, y: float) -> int | None:  # type: ignore[no-untyped-def]
+        try:
+            cv2 = _require_cv2()
+            import numpy as np
+        except Exception:
+            return None
+
+        try:
+            source = np.array(corners, dtype=np.float32)
+            destination = np.array([(0.0, 0.0), (1.0, 0.0), (1.0, 7.0), (0.0, 7.0)], dtype=np.float32)
+            transform = cv2.getPerspectiveTransform(source, destination)
+            point = np.array([[[float(x), float(y)]]], dtype=np.float32)
+            mapped = cv2.perspectiveTransform(point, transform)[0][0]
+        except Exception:
+            return None
+
+        grid_x = float(mapped[0])
+        grid_y = float(mapped[1])
+        if grid_x < -0.05 or grid_x > 1.05 or grid_y < -0.05 or grid_y > 7.05:
+            return None
+        return max(0, min(6, int(grid_y)))
+
+    def _tile_rack_slot_index_from_camera_point(self, rect, x: float, y: float) -> int | None:  # type: ignore[no-untyped-def]
+        rect_x, rect_y, rect_width, rect_height = rect
+        if x < rect_x or x > rect_x + rect_width or y < rect_y or y > rect_y + rect_height:
+            return None
+        slot_height = rect_height / 7.0
+        if slot_height <= 0:
+            return None
+        return max(0, min(6, int((y - rect_y) / slot_height)))
+
     def _tile_rack_slot_position(self, slot_index: int) -> tuple[float, float]:
         if slot_index < 0 or slot_index >= 7:
             raise ValueError("Tile rack target must be TR1 through TR7.")
@@ -601,6 +2238,10 @@ class ScrabblePlotterApp:
 
     def _ensure_tile_rack_move_state(self) -> None:
         if getattr(self, "_tile_rack_move_state_ready", False):
+            if not hasattr(self, "tile_rack_letter_vars"):
+                self.tile_rack_letter_vars = [tk.StringVar(value="") for _ in range(7)]
+            if not hasattr(self, "tile_rack_word_suggestions_var"):
+                self.tile_rack_word_suggestions_var = tk.StringVar(value="")
             return
 
         default_feed = "1500"
@@ -616,6 +2257,8 @@ class ScrabblePlotterApp:
         self.tile_rack_tile_size_var = tk.StringVar(value="10")
         self.tile_rack_feed_var = tk.StringVar(value=default_feed)
         self.tile_rack_status_var = tk.StringVar(value="Enter TR1 to TR7 in Move Plotter to go to rack slots.")
+        self.tile_rack_letter_vars = [tk.StringVar(value="") for _ in range(7)]
+        self.tile_rack_word_suggestions_var = tk.StringVar(value="")
         self._tile_rack_move_state_ready = True
 
     def _send_tile_rack_move_command(self, command: str) -> None:
@@ -803,17 +2446,104 @@ class ScrabblePlotterApp:
             if callable(log):
                 log(f"Startup Z up command skipped: {exc}")
 
+    def _pick_current_position_and_drop_to_board(self) -> None:
+        board_target = self._pick_drop_board_target()
+        if board_target is None:
+            raise ValueError("Enter the board drop square, for example A1.")
+
+        self._set_status(f"Picking current tile and dropping on {board_target}...")
+        self._log(f"Pick/drop current position -> {board_target}")
+        steps = [
+            ("Z down", lambda: self._send_pick_drop_ordered_command("ZD")),
+            ("Magnet on", lambda: self._send_pick_drop_ordered_command("R1")),
+            ("Z up", lambda: self._send_pick_drop_ordered_command("ZU")),
+            (f"Move to {board_target} to drop", lambda: self._send_pick_drop_ordered_board_move(board_target)),
+            ("Z down", lambda: self._send_pick_drop_ordered_command("ZD")),
+            ("Magnet off", lambda: self._send_pick_drop_ordered_command("R0")),
+            ("Z up", lambda: self._send_pick_drop_ordered_command("ZU")),
+        ]
+        self._run_pick_drop_steps(steps, board_target)
+
+    def _send_pick_drop_ordered_command(self, command: str) -> None:
+        sender = getattr(self, "_send_tile_rack_move_command", None)
+        if callable(sender):
+            sender(command)
+            return
+
+        self._send_pick_drop_aux_command(command)
+
+    def _send_pick_drop_ordered_board_move(self, square_label: str) -> None:
+        square = parse_square_label(square_label)
+        calibration = self._calibration_from_form()
+        x, y = calibration.square_center_in_machine(square)
+        feed = self._pick_drop_feed_rate()
+        command = f"G0 X{x:g} Y{y:g} F{feed:g}"
+        self._send_pick_drop_ordered_command(command)
+        self.square_var.set(square_label)
+        self._log(command)
+
+    def _pick_drop_feed_rate(self) -> float:
+        for name in ("feed_rate_var", "feed_var", "plotter_feed_rate_var", "tile_rack_feed_var"):
+            source = getattr(self, name, None)
+            if source is None:
+                continue
+            try:
+                return float(source.get() if hasattr(source, "get") else source)
+            except Exception:
+                continue
+        return 1500.0
+
+    def _run_pick_drop_steps(self, steps, board_target: str, index: int = 0) -> None:  # type: ignore[no-untyped-def]
+        if index >= len(steps):
+            self._set_status(f"Picked current tile and dropped on {board_target}.")
+            return
+
+        label, action = steps[index]
+        try:
+            self._set_status(f"Pick/drop step {index + 1}/{len(steps)}: {label}")
+            self._log(f"Pick/drop step {index + 1}: {label}")
+            action()
+        except Exception as exc:
+            self._show_error(exc)
+            return
+
+        self.root.after(1000, lambda: self._run_pick_drop_steps(steps, board_target, index + 1))
+
+    def _pick_drop_board_target(self) -> str | None:
+        values: list[tuple[str, str]] = []
+        for name, source in vars(self).items():
+            if not hasattr(source, "get"):
+                continue
+            try:
+                value = source.get()
+            except Exception:
+                continue
+            text = str(value).strip()
+            if text:
+                values.append((name.lower(), text))
+
+        drop_words = ("drop", "to", "target", "destination", "place")
+        for name, text in values:
+            if any(word in name for word in drop_words) and self._looks_like_board_square(text):
+                return text.upper()
+
+        square_var = getattr(self, "square_var", None)
+        if square_var is not None:
+            try:
+                square_text = str(square_var.get()).strip()
+            except Exception:
+                square_text = ""
+            if self._looks_like_board_square(square_text):
+                return square_text.upper()
+
+        for _name, text in values:
+            if self._looks_like_board_square(text):
+                return text.upper()
+        return None
+
     def pick_and_drop(self) -> None:
         try:
-            if self._pick_and_drop_from_tile_rack_target():
-                return
-            previous_force_z_up = getattr(self, "_force_z_up_before_pick_drop_move", False)
-            self._force_z_up_before_pick_drop_move = True
-            try:
-                self._pick_and_drop_board_only()
-                self._send_pick_drop_aux_command("ZU")
-            finally:
-                self._force_z_up_before_pick_drop_move = previous_force_z_up
+            self._pick_current_position_and_drop_to_board()
         except Exception as exc:
             self._show_error(exc)
 
@@ -1053,8 +2783,31 @@ class ScrabblePlotterApp:
                 width=5,
             ).grid(row=index // 4, column=index % 4, sticky="ew", padx=2, pady=2)
 
+        ttk.Button(window, text="Capture Rack Letters", command=self.capture_tile_rack_letters).grid(
+            row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 4)
+        )
+
+        rack_letters_frame = ttk.LabelFrame(window, text="Tile Rack Letters")
+        rack_letters_frame.grid(row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        self._build_tile_rack_letter_grid(rack_letters_frame)
+
+        ttk.Button(window, text="Suggest Rack Words", command=self.suggest_tile_rack_words).grid(
+            row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 4)
+        )
+
+        suggestions_frame = ttk.LabelFrame(window, text="Suggested Words")
+        suggestions_frame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
+        ttk.Label(
+            suggestions_frame,
+            textvariable=self.tile_rack_word_suggestions_var,
+            width=36,
+            anchor="nw",
+            justify="left",
+            wraplength=280,
+        ).grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
         ttk.Label(window, textvariable=self.tile_rack_status_var, wraplength=280).grid(
-            row=5, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10)
+            row=9, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10)
         )
         return
 
@@ -2853,7 +4606,16 @@ class ScrabblePlotterApp:
         self._last_camera_letter_scan = scan
         captured_text = scan.text()
         self.captured_letters_var.set(captured_text)
-        aligned_count = self._apply_camera_ocr_grid_to_board_form(scan.grid) if announce else 0
+        self._lock_scan_to_manual_board_grid(scan)
+        aligned_count = 0
+        if announce:
+            aligned_count = self._apply_camera_letter_scan_to_locked_board_grid(scan)
+            if aligned_count == 0:
+                aligned_count = self._apply_camera_ocr_grid_to_board_form(scan.grid)
+        if announce:
+            self._clear_tile_rack_side_from_main_ocr_grid()
+        if announce:
+            self._clear_tile_rack_side_from_main_ocr_grid()
         if captured_text:
             message = f"Captured {len(scan.letters)} letter group(s): {captured_text}"
         else:
@@ -2897,7 +4659,12 @@ class ScrabblePlotterApp:
         self._camera_word_scan_running = False
         self._last_live_word_scan_error = None
         self._last_camera_word_scan = scan
-        aligned_count = self._apply_camera_ocr_grid_to_board_form(scan.grid) if announce else 0
+        self._lock_scan_to_manual_board_grid(scan)
+        aligned_count = 0
+        if announce:
+            aligned_count = self._apply_camera_letter_scan_to_locked_board_grid(scan)
+            if aligned_count == 0:
+                aligned_count = self._apply_camera_ocr_grid_to_board_form(scan.grid)
         formatted_words = format_camera_words_numbered(scan.words)
         if scan.grid is not None and scan.grid.cells:
             grid_words = matched_matrix_words(scan.grid.board_letters())
@@ -3254,9 +5021,12 @@ class ScrabblePlotterApp:
         thread.start()
 
     def _current_camera_ocr_frame(self):  # type: ignore[no-untyped-def]
-        if self._captured_photo_frame is not None:
-            return self._captured_photo_frame
-        return self._latest_frame
+        displayed_frame = getattr(self, "_last_displayed_camera_frame_for_ocr", None)
+        if displayed_frame is not None:
+            return displayed_frame
+        if self._latest_frame is not None:
+            return self._latest_frame
+        return self._captured_photo_frame
 
     def _current_camera_ocr_grid(self):  # type: ignore[no-untyped-def]
         if self._last_camera_word_scan is not None and self._last_camera_word_scan.grid is not None:
@@ -3312,6 +5082,7 @@ class ScrabblePlotterApp:
         detected_words = self._last_camera_word_scan.words if self._last_camera_word_scan else []
         detected_tiles = self._last_camera_word_scan.tiles if self._last_camera_word_scan else []
         ocr_grid = self._current_camera_ocr_grid()
+        self._last_displayed_camera_frame_for_ocr = frame.copy()
         display = draw_camera_ocr_overlay(
             frame.copy(),
             captured_letters,
@@ -3319,6 +5090,8 @@ class ScrabblePlotterApp:
             detected_tiles,
             ocr_grid=ocr_grid,
         )
+        display = self._draw_board_pending_corner_overlay(display)
+        display = self._draw_tile_rack_grid_overlay(display)
         rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
         self._preview_source_size = (int(display.shape[1]), int(display.shape[0]))

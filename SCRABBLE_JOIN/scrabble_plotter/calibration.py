@@ -45,6 +45,7 @@ class PlotterCalibration:
     offset_x_mm: float = 0.0
     offset_y_mm: float = 0.0
     cell_size_mm: float = CELL_SIZE_MM
+    cell_margin_mm: float = 0.0
     x_steps_per_mm: float = 80.0
     y_steps_per_mm: float = 80.0
     cart_x_mm: float = 0.0
@@ -103,8 +104,9 @@ class PlotterCalibration:
         return (float(transformed[0][0][0]), float(transformed[0][0][1]))
 
     def square_center_in_machine(self, square: Square) -> tuple[float, float]:
-        x = self.offset_x_mm + (square.col + 0.5) * self.cell_size_mm
-        y = self.offset_y_mm + (square.row + 0.5) * self.cell_size_mm
+        pitch_mm = self.cell_size_mm + self.cell_margin_mm
+        x = self.offset_x_mm + square.col * pitch_mm + self.cell_size_mm / 2.0
+        y = self.offset_y_mm + square.row * pitch_mm + self.cell_size_mm / 2.0
         return (x, y)
 
     def cart_position_in_machine(self) -> tuple[float, float]:
