@@ -27,6 +27,9 @@ float defaultFeedRate = 1500.0;
 Servo zServo;
 int zUpAngle = 20;
 int zDownAngle = 80;
+const byte Z_SERVO_REFRESH_WRITES = 6;
+const unsigned long Z_SERVO_REFRESH_GAP_MS = 30;
+const unsigned long Z_SERVO_SETTLE_MS = 650;
 
 String inputLine;
 
@@ -226,11 +229,19 @@ void moveTo(float targetX, float targetY, float feedRate) {
 }
 
 void zMoveUp() {
-  zServo.write(zUpAngle);
+  moveZServoTo(zUpAngle);
 }
 
 void zMoveDown() {
-  zServo.write(zDownAngle);
+  moveZServoTo(zDownAngle);
+}
+
+void moveZServoTo(int angle) {
+  for (byte index = 0; index < Z_SERVO_REFRESH_WRITES; index++) {
+    zServo.write(angle);
+    delay(Z_SERVO_REFRESH_GAP_MS);
+  }
+  delay(Z_SERVO_SETTLE_MS);
 }
 
 void magnetOn() {

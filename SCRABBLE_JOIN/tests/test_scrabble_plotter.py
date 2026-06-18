@@ -21,9 +21,9 @@ from scrabble_plotter.gemini_agent import (
     parse_detected_words,
 )
 from scrabble_plotter.gui import (
-    PICK_DROP_LIFT_RETRY_SECONDS,
-    PICK_DROP_MAGNET_SETTLE_SECONDS,
-    PICK_DROP_Z_SETTLE_SECONDS,
+    PICK_DROP_MAGNET_DELAY_MS,
+    PICK_DROP_MOVE_DELAY_MS,
+    PICK_DROP_Z_SETTLE_DELAY_MS,
     ScrabblePlotterApp,
     Z_DOWN_COMMAND,
     Z_UP_COMMAND,
@@ -897,40 +897,100 @@ class _FakeVar:
     def get(self) -> str:
         return self.value
 
-
-class _RecordingPickDropSender:
-    def __init__(self) -> None:
-        self.calls: list[tuple[object, ...]] = []
-
-    def send_move(
-        self,
-        x: float,
-        y: float,
-        feed_rate: float | None = None,
-        command: str = "G0",
-    ) -> tuple[str, list[str]]:
-        self.calls.append(("move", x, y, feed_rate, command))
-        return format_move_command(x, y, feed_rate=feed_rate, command=command), ["OK"]
-
-    def send_command(self, command: str, *, startup_g90: bool | None = None) -> list[str]:
-        self.calls.append(("command", command, startup_g90))
-        return [f"OK {command}"]
+    def set(self, value: object) -> None:
+        self.value = str(value)
 
 
-def _make_pick_drop_app(feed_rate: str = "1500", command: str = "G0") -> ScrabblePlotterApp:
-    app = object.__new__(ScrabblePlotterApp)
-    app.feed_rate_var = _FakeVar(feed_rate)
-    app.command_var = _FakeVar(command)
-    app.sender = _RecordingPickDropSender()
-    app.logs = []
-    app.statuses = []
-    app.waits = []
-    app._calibration_from_form = lambda: PlotterCalibration(offset_x_mm=10.0, offset_y_mm=20.0)
-    app._get_sender = lambda: app.sender
-    app._log = app.logs.append
-    app._set_status = app.statuses.append
-    app._pick_drop_wait = app.waits.append
-    return app
+class PickDropTests(unittest.TestCase):
+    def test_pick_and_drop_runs_requested_order_from_rack_to_board(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.statuses = []
+        app.logs = []
+        app.calls = []
+        app.delays = []
+
+        class ImmediateRoot:
+            def after(self, delay, callback):  # type: ignore[no-untyped-def]
+                app.delays.append(delay)
+                callback()
+
+        app.root = ImmediateRoot()
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+        app._show_error = lambda exc: (_ for _ in ()).throw(exc)
+        app._send_pick_drop_ordered_command = lambda command: app.calls.append(("command", command))
+        app._send_pick_drop_ordered_target_move = lambda target: app.calls.append(("move", target))
+
+        ScrabblePlotterApp._pick_and_drop_targets(app, "TR1", "H8")
+
+        self.assertEqual(
+            app.calls,
+            [
+                ("command", Z_UP_COMMAND),
+                ("move", "TR1"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M1"),
+                ("command", Z_UP_COMMAND),
+                ("move", "H8"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M0"),
+                ("command", Z_UP_COMMAND),
+            ],
+        )
+        self.assertEqual(app.statuses[-1], "Picked current tile and dropped on H8.")
+        self.assertEqual(app.delays[0], PICK_DROP_Z_SETTLE_DELAY_MS)
+        self.assertEqual(app.delays[1], PICK_DROP_MOVE_DELAY_MS)
+        self.assertEqual(app.delays[3], PICK_DROP_MAGNET_DELAY_MS)
+        self.assertEqual(app.delays[6], PICK_DROP_Z_SETTLE_DELAY_MS)
+        self.assertEqual(app.delays[7], PICK_DROP_MAGNET_DELAY_MS)
+
+    def test_pick_and_drop_accepts_board_pickup_and_rejects_bad_targets(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+
+        ScrabblePlotterApp._validate_pick_drop_targets(app, "A1", "H8")
+        ScrabblePlotterApp._validate_pick_drop_targets(app, "TR7", "H8")
+
+        with self.assertRaises(ValueError):
+            ScrabblePlotterApp._validate_pick_drop_targets(app, "TR8", "H8")
+        with self.assertRaises(ValueError):
+            ScrabblePlotterApp._validate_pick_drop_targets(app, "TR1", "TR2")
+
+    def test_pick_and_drop_applies_current_z_height_before_sequence(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.pick_square_var = _FakeVar("TR1")
+        app.drop_square_var = _FakeVar("H8")
+        app.z_height_angle = _FakeVar("120")
+        app.calls = []
+        app._send_pick_drop_aux_command = lambda command: app.calls.append(("aux", command))
+        app._pick_and_drop_targets = lambda pickup, drop: app.calls.append(("pick_drop", pickup, drop))
+        app._show_error = lambda exc: (_ for _ in ()).throw(exc)
+
+        ScrabblePlotterApp.pick_and_drop(app)
+
+        self.assertEqual(app.calls, [("aux", "ZH120"), ("pick_drop", "TR1", "H8")])
+
+    def test_pick_and_drop_rejects_overlapping_sequence(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._pick_drop_running = True
+        app.pick_square_var = _FakeVar("TR1")
+        app.drop_square_var = _FakeVar("H8")
+        app.errors = []
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.pick_and_drop(app)
+
+        self.assertEqual(len(app.errors), 1)
+        self.assertIn("already running", str(app.errors[0]))
+
+    def test_pick_drop_auxiliary_commands_do_not_use_rack_move_sender(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.calls = []
+        app._send_tile_rack_move_command = lambda command: app.calls.append(("rack", command))
+        app._send_pick_drop_aux_command = lambda command: app.calls.append(("aux", command))
+
+        ScrabblePlotterApp._send_pick_drop_ordered_command(app, "ZU")
+
+        self.assertEqual(app.calls, [("aux", "ZU")])
 
 
 class SerialSenderTests(unittest.TestCase):
@@ -962,79 +1022,6 @@ class SerialSenderTests(unittest.TestCase):
 
         self.assertEqual(app.sender.calls, [("M1", False)])
         self.assertEqual(responses, ["OK MAGNET ON"])
-
-    def test_pick_and_drop_uses_feed_rate_and_exact_command_order(self) -> None:
-        app = _make_pick_drop_app(feed_rate="1500", command="G1")
-
-        ScrabblePlotterApp._send_pick_and_drop(app, "A1", "H8")
-
-        self.assertEqual(
-            app.sender.calls,
-            [
-                ("move", 25.0, 35.0, 1500.0, "G1"),
-                ("command", Z_DOWN_COMMAND, False),
-                ("command", "M1", False),
-                ("command", Z_UP_COMMAND, False),
-                ("command", Z_UP_COMMAND, False),
-                ("move", 235.0, 245.0, 1500.0, "G1"),
-                ("command", Z_DOWN_COMMAND, False),
-                ("command", "M0", False),
-            ],
-        )
-        self.assertEqual(
-            app.waits,
-            [
-                PICK_DROP_Z_SETTLE_SECONDS,
-                PICK_DROP_MAGNET_SETTLE_SECONDS,
-                PICK_DROP_LIFT_RETRY_SECONDS,
-                PICK_DROP_Z_SETTLE_SECONDS,
-                PICK_DROP_Z_SETTLE_SECONDS,
-            ],
-        )
-        self.assertEqual(app.statuses[-1], "Pick/drop complete: A1 -> H8")
-
-    def test_pick_and_drop_blank_feed_rate_uses_firmware_default(self) -> None:
-        app = _make_pick_drop_app(feed_rate="")
-
-        ScrabblePlotterApp._send_pick_and_drop(app, "A1", "A2")
-
-        move_calls = [call for call in app.sender.calls if call[0] == "move"]
-        self.assertEqual(move_calls[0], ("move", 25.0, 35.0, None, "G0"))
-        self.assertEqual(move_calls[1], ("move", 25.0, 65.0, None, "G0"))
-
-    def test_pick_and_drop_validates_inputs_before_sending(self) -> None:
-        for pick_square, drop_square, feed_rate in (("BAD", "H8", "1500"), ("A1", "H8", "fast")):
-            with self.subTest(pick_square=pick_square, drop_square=drop_square, feed_rate=feed_rate):
-                app = _make_pick_drop_app(feed_rate=feed_rate)
-
-                with self.assertRaises(ValueError):
-                    ScrabblePlotterApp._send_pick_and_drop(app, pick_square, drop_square)
-
-                self.assertEqual(app.sender.calls, [])
-
-    def test_pick_and_drop_stops_when_arduino_rejects_command(self) -> None:
-        class FailingMagnetSender(_RecordingPickDropSender):
-            def send_command(self, command: str, *, startup_g90: bool | None = None) -> list[str]:
-                self.calls.append(("command", command, startup_g90))
-                if command == "M1":
-                    return ["ERR UNKNOWN COMMAND M1"]
-                return [f"OK {command}"]
-
-        app = _make_pick_drop_app()
-        app.sender = FailingMagnetSender()
-
-        with self.assertRaisesRegex(RuntimeError, "Arduino rejected M1"):
-            ScrabblePlotterApp._send_pick_and_drop(app, "A1", "H8")
-
-        self.assertEqual(
-            app.sender.calls,
-            [
-                ("move", 25.0, 35.0, 1500.0, "G0"),
-                ("command", Z_DOWN_COMMAND, False),
-                ("command", "M1", False),
-            ],
-        )
-
 
 class _FakeFrame:
     def __init__(self, shape: tuple[int, ...] = (2, 2, 3)):

@@ -51,11 +51,12 @@ BEST_CAPTURE_FRAME_COUNT = 18
 BEST_CAPTURE_TIMEOUT_SECONDS = 1.0
 BEST_CAPTURE_FRAME_DELAY_SECONDS = 0.025
 CAMERA_READ_FAILURE_LIMIT = 10
-PICK_DROP_Z_SETTLE_SECONDS = 0.8
-PICK_DROP_MAGNET_SETTLE_SECONDS = 1.0
-PICK_DROP_LIFT_RETRY_SECONDS = 0.35
 Z_DOWN_COMMAND = "ZU"
 Z_UP_COMMAND = "ZD"
+PICK_DROP_DEFAULT_DELAY_MS = 1000
+PICK_DROP_MAGNET_DELAY_MS = 1000
+PICK_DROP_MOVE_DELAY_MS = 1000
+PICK_DROP_Z_SETTLE_DELAY_MS = 1000
 
 
 class ScrabblePlotterApp:
@@ -87,7 +88,7 @@ class ScrabblePlotterApp:
         self.ocr_confidence_threshold_var = tk.StringVar(value=str(self._calibration.ocr_confidence_threshold))
         self.ocr_cell_size_px_var = tk.StringVar(value=str(self._calibration.ocr_cell_size_px))
         self.square_var = tk.StringVar(value="H8")
-        self.pick_square_var = tk.StringVar(value="A1")
+        self.pick_square_var = tk.StringVar(value="TR1")
         self.drop_square_var = tk.StringVar(value="H8")
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
@@ -261,8 +262,8 @@ class ScrabblePlotterApp:
 
         move_fields = [
             ("Square", self.square_var),
-            ("Pick Square", self.pick_square_var),
-            ("Drop Square", self.drop_square_var),
+            ("Pickup", self.pick_square_var),
+            ("Drop", self.drop_square_var),
             ("COM Port", self.port_var),
             ("Baud", self.baud_var),
             ("Feed Rate", self.feed_rate_var),
@@ -2362,15 +2363,15 @@ class ScrabblePlotterApp:
 
         self._set_status(f"Picking from {rack_target} and dropping on {board_target}...")
         self._log(f"Rack pickup through normal pick/drop: {rack_target} -> {board_target}")
-        self._send_pick_drop_aux_command("ZU")
+        self._send_pick_drop_aux_command(Z_UP_COMMAND)
         self._send_tile_rack_target_move(rack_target)
-        self._send_pick_drop_aux_command("ZD")
+        self._send_pick_drop_aux_command(Z_DOWN_COMMAND)
         self._send_pick_drop_aux_command("R1")
-        self._send_pick_drop_aux_command("ZU")
+        self._send_pick_drop_aux_command(Z_UP_COMMAND)
         self._send_square_move(board_target)
-        self._send_pick_drop_aux_command("ZD")
+        self._send_pick_drop_aux_command(Z_DOWN_COMMAND)
         self._send_pick_drop_aux_command("R0")
-        self._send_pick_drop_aux_command("ZU")
+        self._send_pick_drop_aux_command(Z_UP_COMMAND)
         self._set_status(f"Picked from {rack_target} and dropped on {board_target}.")
         return True
 
@@ -2439,7 +2440,7 @@ class ScrabblePlotterApp:
 
     def _send_startup_z_up(self) -> None:
         try:
-            self._send_pick_drop_aux_command("ZU")
+            self._send_pick_drop_aux_command(Z_UP_COMMAND)
             self._log("Startup Z up command sent.")
         except Exception as exc:
             log = getattr(self, "_log", None)
@@ -2454,33 +2455,70 @@ class ScrabblePlotterApp:
         self._set_status(f"Picking current tile and dropping on {board_target}...")
         self._log(f"Pick/drop current position -> {board_target}")
         steps = [
-            ("Z down", lambda: self._send_pick_drop_ordered_command("ZD")),
+            ("Z down", lambda: self._send_pick_drop_ordered_command(Z_DOWN_COMMAND)),
             ("Magnet on", lambda: self._send_pick_drop_ordered_command("R1")),
-            ("Z up", lambda: self._send_pick_drop_ordered_command("ZU")),
+            ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
             (f"Move to {board_target} to drop", lambda: self._send_pick_drop_ordered_board_move(board_target)),
-            ("Z down", lambda: self._send_pick_drop_ordered_command("ZD")),
+            ("Z down", lambda: self._send_pick_drop_ordered_command(Z_DOWN_COMMAND)),
             ("Magnet off", lambda: self._send_pick_drop_ordered_command("R0")),
-            ("Z up", lambda: self._send_pick_drop_ordered_command("ZU")),
+            ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
         ]
         self._run_pick_drop_steps(steps, board_target)
 
-    def _send_pick_drop_ordered_command(self, command: str) -> None:
-        sender = getattr(self, "_send_tile_rack_move_command", None)
-        if callable(sender):
-            sender(command)
-            return
+    def pick_and_drop(self) -> None:
+        try:
+            if getattr(self, "_pick_drop_running", False):
+                raise RuntimeError("Pick/drop is already running. Wait until it finishes before starting again.")
+            pickup_target = self.pick_square_var.get().strip().upper()
+            drop_target = self.drop_square_var.get().strip().upper()
+            self._validate_pick_drop_targets(pickup_target, drop_target)
+            self._apply_pick_drop_z_height()
+            self._pick_drop_running = True
+            self._pick_and_drop_targets(pickup_target, drop_target)
+        except Exception as exc:
+            self._pick_drop_running = False
+            self._show_error(exc)
 
+    def _validate_pick_drop_targets(self, pickup_target: str, drop_target: str) -> None:
+        if not (self._is_tile_rack_target(pickup_target) or self._looks_like_board_square(pickup_target)):
+            raise ValueError("Enter pickup as a board square like A1 or rack slot TR1 to TR7.")
+        if not self._looks_like_board_square(drop_target):
+            raise ValueError("Enter drop as a board square like H8.")
+
+    def _apply_pick_drop_z_height(self) -> None:
+        angle = int(float(self.z_height_angle.get()))
+        angle = max(0, min(180, angle))
+        self.z_height_angle.set(angle)
+        self._send_pick_drop_aux_command(f"ZH{angle}")
+
+    def _pick_and_drop_targets(self, pickup_target: str, drop_target: str) -> None:
+        self._set_status(f"Picking from {pickup_target} and dropping on {drop_target}...")
+        self._log(f"Pick/drop: {pickup_target} -> {drop_target}")
+        steps = [
+            ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+            (f"Move to pickup {pickup_target}", lambda: self._send_pick_drop_ordered_target_move(pickup_target)),
+            ("Z down", lambda: self._send_pick_drop_ordered_command(Z_DOWN_COMMAND)),
+            ("Magnet on", lambda: self._send_pick_drop_ordered_command("M1")),
+            ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+            (f"Move to drop {drop_target}", lambda: self._send_pick_drop_ordered_target_move(drop_target)),
+            ("Z down", lambda: self._send_pick_drop_ordered_command(Z_DOWN_COMMAND)),
+            ("Magnet off", lambda: self._send_pick_drop_ordered_command("M0")),
+            ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+        ]
+        self._run_pick_drop_steps(steps, drop_target)
+
+    def _send_pick_drop_ordered_command(self, command: str) -> None:
         self._send_pick_drop_aux_command(command)
 
+    def _send_pick_drop_ordered_target_move(self, target: str) -> None:
+        target = target.strip().upper()
+        if self._is_tile_rack_target(target):
+            self._send_tile_rack_target_move(target)
+            return
+        self._send_pick_drop_ordered_board_move(target)
+
     def _send_pick_drop_ordered_board_move(self, square_label: str) -> None:
-        square = parse_square_label(square_label)
-        calibration = self._calibration_from_form()
-        x, y = calibration.square_center_in_machine(square)
-        feed = self._pick_drop_feed_rate()
-        command = f"G0 X{x:g} Y{y:g} F{feed:g}"
-        self._send_pick_drop_ordered_command(command)
-        self.square_var.set(square_label)
-        self._log(command)
+        self._send_square_move(square_label)
 
     def _pick_drop_feed_rate(self) -> float:
         for name in ("feed_rate_var", "feed_var", "plotter_feed_rate_var", "tile_rack_feed_var"):
@@ -2495,6 +2533,7 @@ class ScrabblePlotterApp:
 
     def _run_pick_drop_steps(self, steps, board_target: str, index: int = 0) -> None:  # type: ignore[no-untyped-def]
         if index >= len(steps):
+            self._pick_drop_running = False
             self._set_status(f"Picked current tile and dropped on {board_target}.")
             return
 
@@ -2504,10 +2543,22 @@ class ScrabblePlotterApp:
             self._log(f"Pick/drop step {index + 1}: {label}")
             action()
         except Exception as exc:
+            self._pick_drop_running = False
             self._show_error(exc)
             return
 
-        self.root.after(1000, lambda: self._run_pick_drop_steps(steps, board_target, index + 1))
+        delay_ms = self._pick_drop_step_delay_ms(label)
+        self.root.after(delay_ms, lambda: self._run_pick_drop_steps(steps, board_target, index + 1))
+
+    def _pick_drop_step_delay_ms(self, label: str) -> int:
+        lowered = label.lower()
+        if lowered.startswith("z "):
+            return PICK_DROP_Z_SETTLE_DELAY_MS
+        if lowered.startswith("magnet "):
+            return PICK_DROP_MAGNET_DELAY_MS
+        if lowered.startswith("move "):
+            return PICK_DROP_MOVE_DELAY_MS
+        return PICK_DROP_DEFAULT_DELAY_MS
 
     def _pick_drop_board_target(self) -> str | None:
         values: list[tuple[str, str]] = []
@@ -2540,18 +2591,6 @@ class ScrabblePlotterApp:
             if self._looks_like_board_square(text):
                 return text.upper()
         return None
-
-    def pick_and_drop(self) -> None:
-        try:
-            self._pick_current_position_and_drop_to_board()
-        except Exception as exc:
-            self._show_error(exc)
-
-    def _pick_and_drop_board_only(self) -> None:
-        try:
-            self._send_pick_and_drop(self.pick_square_var.get(), self.drop_square_var.get())
-        except Exception as exc:
-            self._show_error(exc)
 
     def _handle_ocr_board_cell_click(self, row: int, col: int) -> None:
         square = f"{chr(ord('A') + col)}{row + 1}"
@@ -4857,65 +4896,6 @@ class ScrabblePlotterApp:
         self._log(f"Sent: {gcode}")
         if responses:
             self._log("Responses: " + " | ".join(responses))
-
-    def _send_pick_and_drop(self, pick_square_label: str, drop_square_label: str) -> None:
-        calibration = self._calibration_from_form()
-        calibration.validate_ready_for_move()
-        pick_square = parse_square_label(pick_square_label)
-        drop_square = parse_square_label(drop_square_label)
-        feed_rate = self._optional_float(self.feed_rate_var.get())
-        command = self.command_var.get().strip() or "G0"
-        pick_x, pick_y = calibration.square_center_in_machine(pick_square)
-        drop_x, drop_y = calibration.square_center_in_machine(drop_square)
-
-        sender = self._get_sender()
-        self._send_pick_drop_move(sender, pick_x, pick_y, feed_rate, command)
-        self._send_pick_drop_auxiliary(sender, Z_DOWN_COMMAND)
-        self._pick_drop_wait(PICK_DROP_Z_SETTLE_SECONDS)
-        self._send_pick_drop_auxiliary(sender, "M1")
-        self._pick_drop_wait(PICK_DROP_MAGNET_SETTLE_SECONDS)
-        self._send_pick_drop_auxiliary(sender, Z_UP_COMMAND)
-        self._pick_drop_wait(PICK_DROP_LIFT_RETRY_SECONDS)
-        self._send_pick_drop_auxiliary(sender, Z_UP_COMMAND)
-        self._pick_drop_wait(PICK_DROP_Z_SETTLE_SECONDS)
-        self._send_pick_drop_move(sender, drop_x, drop_y, feed_rate, command)
-        self._send_pick_drop_auxiliary(sender, Z_DOWN_COMMAND)
-        self._pick_drop_wait(PICK_DROP_Z_SETTLE_SECONDS)
-        self._send_pick_drop_auxiliary(sender, "M0")
-
-        self._set_status(f"Pick/drop complete: {pick_square.label} -> {drop_square.label}")
-
-    def _send_pick_drop_move(
-        self,
-        sender: GCodeSender,
-        x: float,
-        y: float,
-        feed_rate: float | None,
-        command: str,
-    ) -> None:
-        gcode, responses = sender.send_move(x, y, feed_rate=feed_rate, command=command)
-        self._log(f"Sent: {gcode}")
-        if responses:
-            self._log("Responses: " + " | ".join(responses))
-        self._raise_for_pick_drop_error(gcode, responses)
-
-    def _send_pick_drop_auxiliary(self, sender: GCodeSender, command: str) -> None:
-        responses = sender.send_command(command, startup_g90=False)
-        self._log(f"Sent auxiliary command: {command}")
-        if responses:
-            self._log("Responses: " + " | ".join(responses))
-        self._raise_for_pick_drop_error(command, responses)
-
-    def _raise_for_pick_drop_error(self, command: str, responses: list[str]) -> None:
-        if not responses:
-            raise RuntimeError(f"No Arduino response after {command}; stopped pick/drop sequence.")
-        for response in responses:
-            lowered = response.lower()
-            if lowered.startswith("err") or lowered.startswith("error"):
-                raise RuntimeError(f"Arduino rejected {command}: {response}")
-
-    def _pick_drop_wait(self, seconds: float) -> None:
-        time.sleep(seconds)
 
     def _send_reset(self) -> None:
         sender = self._get_sender()
