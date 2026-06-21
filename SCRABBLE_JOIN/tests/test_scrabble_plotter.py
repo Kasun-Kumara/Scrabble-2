@@ -1017,6 +1017,75 @@ class PickDropTests(unittest.TestCase):
 
         self.assertEqual(app.calls, [("aux", "ZU")])
 
+    def test_tile_rack_move_uses_plotter_sender_not_actuator_sender(self) -> None:
+        class Sender:
+            def __init__(self) -> None:
+                self.commands = []
+
+            def send_command(self, command: str) -> list[str]:
+                self.commands.append(command)
+                return ["ok"]
+
+        app = object.__new__(ScrabblePlotterApp)
+        sender = Sender()
+        app.logs = []
+        app._serial_config = lambda: SerialConfig("COM5", 115200, 0.01, False)
+        app._get_sender_for_config = lambda config: sender
+        app._send_actuator_command = lambda command: (_ for _ in ()).throw(
+            AssertionError("rack movement must not use the board actuator")
+        )
+        app._send_auxiliary_command = lambda command: (_ for _ in ()).throw(
+            AssertionError("rack movement must not use auxiliary Z/magnet sender")
+        )
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._send_tile_rack_move_command(app, "G0 X335 Y30 F1500")
+
+        self.assertEqual(sender.commands, ["G0 X335 Y30 F1500"])
+
+    def test_tile_rack_move_raises_on_plotter_controller_error(self) -> None:
+        class Sender:
+            def send_command(self, command: str) -> list[str]:
+                return ["err unknown command"]
+
+        app = object.__new__(ScrabblePlotterApp)
+        app.logs = []
+        app._serial_config = lambda: SerialConfig("COM5", 115200, 0.01, False)
+        app._get_sender_for_config = lambda config: Sender()
+        app._log = app.logs.append
+
+        with self.assertRaisesRegex(RuntimeError, "err unknown command"):
+            ScrabblePlotterApp._send_tile_rack_move_command(app, "G0 X335 Y30 F1500")
+
+    def test_pick_drop_stops_after_failed_step(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._pick_drop_running = True
+        app.statuses = []
+        app.logs = []
+        app.errors = []
+        app.delays = []
+
+        class ImmediateRoot:
+            def after(self, delay, callback):  # type: ignore[no-untyped-def]
+                app.delays.append(delay)
+                callback()
+
+        app.root = ImmediateRoot()
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+        app._show_error = app.errors.append
+        steps = [
+            ("Move to pickup TR1", lambda: (_ for _ in ()).throw(RuntimeError("controller failed"))),
+            ("Z down", lambda: (_ for _ in ()).throw(AssertionError("sequence should stop"))),
+        ]
+
+        ScrabblePlotterApp._run_pick_drop_steps(app, steps, "H8")
+
+        self.assertFalse(app._pick_drop_running)
+        self.assertEqual(len(app.errors), 1)
+        self.assertIn("controller failed", str(app.errors[0]))
+        self.assertEqual(app.delays, [])
+
 
 class SerialSenderTests(unittest.TestCase):
     def test_auxiliary_command_can_reuse_open_connection_without_startup_g90(self) -> None:

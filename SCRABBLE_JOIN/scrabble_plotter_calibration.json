@@ -21,13 +21,16 @@
     ]
   ],
   "camera_index": 1,
-  "offset_x_mm": 169.0,
+  "offset_x_mm": 163.0,
   "offset_y_mm": 44.0,
   "cell_size_mm": 13.3,
   "x_steps_per_mm": 9.0,
   "y_steps_per_mm": 9.0,
   "cart_x_mm": 100.0,
   "cart_y_mm": 75.0,
+  "tile_rack_x_mm": 377.0,
+  "tile_rack_y_mm": 58.0,
+  "tile_rack_pitch_mm": 17.0,
   "premium_layout": [
     [
       "normal",
@@ -200,7 +203,7 @@
   ],
   "ocr_confidence_threshold": 50.0,
   "ocr_cell_size_px": 80,
-  "actuator_port": "COM12",
+  "actuator_port": "COM4",
   "actuator_baud": 115200,
   "actuator_timeout": 2.0,
   "actuator_countdown_seconds": 30

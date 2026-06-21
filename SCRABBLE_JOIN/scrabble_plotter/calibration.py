@@ -53,6 +53,9 @@ class PlotterCalibration:
     y_steps_per_mm: float = 80.0
     cart_x_mm: float = 0.0
     cart_y_mm: float = 0.0
+    tile_rack_x_mm: float = 335.0
+    tile_rack_y_mm: float = 30.0
+    tile_rack_pitch_mm: float = 10.0
     premium_layout: list[list[str]] = field(default_factory=lambda: default_premium_layout())
     ocr_confidence_threshold: float = DEFAULT_OCR_CONFIDENCE_THRESHOLD
     ocr_cell_size_px: int = DEFAULT_OCR_CELL_SIZE_PX
@@ -133,6 +136,9 @@ class PlotterCalibration:
             "y_steps_per_mm": self.y_steps_per_mm,
             "cart_x_mm": self.cart_x_mm,
             "cart_y_mm": self.cart_y_mm,
+            "tile_rack_x_mm": self.tile_rack_x_mm,
+            "tile_rack_y_mm": self.tile_rack_y_mm,
+            "tile_rack_pitch_mm": self.tile_rack_pitch_mm,
             "premium_layout": normalize_premium_layout(self.premium_layout, self.board_size),
             "ocr_confidence_threshold": self.ocr_confidence_threshold,
             "ocr_cell_size_px": self.ocr_cell_size_px,
@@ -157,6 +163,9 @@ class PlotterCalibration:
             y_steps_per_mm=float(payload.get("y_steps_per_mm", 80.0)),
             cart_x_mm=float(payload.get("cart_x_mm", 0.0)),
             cart_y_mm=float(payload.get("cart_y_mm", 0.0)),
+            tile_rack_x_mm=float(payload.get("tile_rack_x_mm", 335.0)),
+            tile_rack_y_mm=float(payload.get("tile_rack_y_mm", 30.0)),
+            tile_rack_pitch_mm=float(payload.get("tile_rack_pitch_mm", 10.0)),
             premium_layout=normalize_premium_layout(
                 payload.get("premium_layout", default_premium_layout()),
                 int(payload.get("board_size", BOARD_SIZE)),
