@@ -1139,11 +1139,16 @@ def cell_looks_occupied(cell_image) -> bool:  # type: ignore[no-untyped-def]
 
 
 def read_cell_with_tesseract(cell_image, square: str) -> tuple[str, float]:  # type: ignore[no-untyped-def]
-    pytesseract = _require_pytesseract()
-    processed = preprocess_cell_for_ocr(cell_image)
-    config = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    data = pytesseract.image_to_data(processed, config=config, output_type=pytesseract.Output.DICT)
-    return parse_tesseract_data(data)
+    try:
+        pytesseract = _require_pytesseract()
+        processed = preprocess_cell_for_ocr(cell_image)
+        config = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        data = pytesseract.image_to_data(processed, config=config, output_type=pytesseract.Output.DICT)
+        return parse_tesseract_data(data)
+    except Exception as exc:
+        if "tesseract is not installed" in str(exc).lower() or "not in your path" in str(exc).lower():
+            return read_tile_letter_with_easyocr(cell_image)
+        raise
 
 
 def parse_tesseract_data(data: dict[str, list[Any]]) -> tuple[str, float]:

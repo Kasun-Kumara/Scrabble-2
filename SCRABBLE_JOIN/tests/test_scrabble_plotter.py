@@ -1169,6 +1169,82 @@ class SerialSenderTests(unittest.TestCase):
         self.assertEqual(responses, ["ok led cells 2"])
 
 
+class GameStateTests(unittest.TestCase):
+    def _game_app(self):
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._player_1_cells = set()
+        app._player_2_cells = set()
+        app._player_1_words = []
+        app._player_2_words = []
+        app._current_player = 1
+        app._previous_board_state = {}
+        app._turn_start_board_state = {}
+        app._turn_scan_started_state = {}
+        app._turn_scan_switch_after = False
+        app._pending_turn_scan = False
+        app._current_player_display_var = _FakeVar("Current Player: 1")
+        app.logs = []
+        app.table_updates = []
+        app.start_turns = []
+        app._log = app.logs.append
+        app._update_words_table = lambda: app.table_updates.append((list(app._player_1_words), list(app._player_2_words)))
+        app._update_grid_colors = lambda: None
+        app._start_turn = lambda: app.start_turns.append(app._current_player)
+        app._calibration_from_form = lambda: PlotterCalibration()
+        app._blank_squares_from_form = lambda: set()
+        return app
+
+    def test_assign_words_uses_turn_start_snapshot_for_correct_player(self) -> None:
+        app = self._game_app()
+        app._letter_vars[0][0].set("C")
+        app._letter_vars[0][1].set("A")
+        app._letter_vars[0][2].set("T")
+        app._letter_vars[1][4].set("D")
+        app._letter_vars[2][4].set("O")
+        app._letter_vars[3][4].set("G")
+        previous_state = {"A1": "C", "B1": "A", "C1": "T"}
+
+        ScrabblePlotterApp._assign_new_words_to_current_player(app, 2, previous_state=previous_state)
+
+        self.assertEqual(app._player_1_words, [])
+        self.assertEqual(app._player_2_words, ["DOG"])
+        self.assertEqual(app._player_2_cells, {"E2", "E3", "E4"})
+        self.assertNotIn("CAT", app._player_2_words)
+
+    def test_scan_start_captures_current_player_two(self) -> None:
+        app = self._game_app()
+        app._current_player = 2
+        app._current_player_display_var.set("Current Player: 2")
+        app._previous_board_state = {"A1": "C"}
+        app._turn_start_board_state = {"A1": "C"}
+
+        player_id = ScrabblePlotterApp._begin_player_scan(app, switch_after_scan=True)
+
+        self.assertEqual(player_id, 2)
+        self.assertTrue(app._pending_turn_scan)
+        self.assertEqual(app._turn_scan_player, 2)
+        self.assertTrue(app._turn_scan_switch_after)
+        self.assertEqual(app._turn_scan_started_state, {"A1": "C"})
+
+    def test_turn_scan_complete_assigns_to_captured_player_two(self) -> None:
+        app = self._game_app()
+        app._current_player = 2
+        app._turn_scan_player = 2
+        app._turn_scan_switch_after = True
+        app._turn_scan_started_state = {}
+        app._letter_vars[1][4].set("D")
+        app._letter_vars[2][4].set("O")
+        app._letter_vars[3][4].set("G")
+
+        ScrabblePlotterApp._on_turn_scan_complete(app)
+
+        self.assertEqual(app._player_1_words, [])
+        self.assertEqual(app._player_2_words, ["DOG"])
+        self.assertEqual(app._current_player, 1)
+        self.assertEqual(app.start_turns, [1])
+
+
 class BoardActuatorGuiTests(unittest.TestCase):
     def test_startup_sends_board_up_when_actuator_port_is_saved(self) -> None:
         app = object.__new__(ScrabblePlotterApp)

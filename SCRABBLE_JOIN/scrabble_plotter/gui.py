@@ -28,7 +28,7 @@ from .scanner import (
     scan_camera_words,
     select_best_frame,
 )
-from .word_bank import format_words_by_direction, matched_matrix_words, normalize_word
+from .word_bank import format_words_by_direction, matched_matrix_words, normalize_word, word_matches_reference
 from .scoring import (
     ScoreResult,
     normalize_letter,
@@ -135,6 +135,22 @@ class ScrabblePlotterApp:
         self._camera_word_scan_running = False
         self._pending_actuator_challenge_after_word_scan = False
         self.camera_words_text: tk.Text | None = None
+
+        self._current_player = 1
+        self._turn_end_time = 0.0
+        self._timer_after_id: str | None = None
+        self._player_1_cells: set[str] = set()
+        self._player_2_cells: set[str] = set()
+        self._previous_board_state: dict[str, str] = {}
+        self._timer_running = False
+        self._timer_display_var = tk.StringVar(value="Time Remaining: 2:00")
+        self._current_player_display_var = tk.StringVar(value="Current Player: -")
+        self._player_1_words: list[str] = []
+        self._player_2_words: list[str] = []
+        self._pending_turn_scan = False
+        self._turn_start_board_state: dict[str, str] = {}
+        self._turn_scan_started_state: dict[str, str] = {}
+        self._turn_scan_switch_after = False
 
         self.status_var = tk.StringVar(
             value="Start the camera to find visible words."
@@ -472,11 +488,26 @@ class ScrabblePlotterApp:
             row=5, column=0, columnspan=3, sticky="ew"
         )
 
+        game_box = ttk.LabelFrame(controls, text="Game State", padding=10)
+        game_box.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        game_box.columnconfigure(1, weight=1)
+        ttk.Label(game_box, textvariable=self._current_player_display_var, font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(game_box, textvariable=self._timer_display_var, font=("TkDefaultFont", 10, "bold")).grid(row=0, column=1, sticky="w", pady=2, padx=(10, 0))
+        ttk.Button(game_box, text="Start Game", command=self._start_game).grid(row=1, column=0, sticky="ew", pady=4, padx=(0, 4))
+        ttk.Button(game_box, text="End Turn", command=self._end_turn).grid(row=1, column=1, sticky="ew", pady=4, padx=(4, 0))
+
+        self.words_table = ttk.Treeview(game_box, columns=("P1", "P2"), show="headings", height=6)
+        self.words_table.heading("P1", text="Player 1 Words")
+        self.words_table.heading("P2", text="Player 2 Words")
+        self.words_table.column("P1", width=140, anchor="center")
+        self.words_table.column("P2", width=140, anchor="center")
+        self.words_table.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
         log_box = ttk.LabelFrame(controls, text="Status", padding=10)
-        log_box.grid(row=5, column=0, sticky="nsew", pady=(12, 0))
+        log_box.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
         log_box.columnconfigure(0, weight=1)
         log_box.rowconfigure(1, weight=1)
-        controls.rowconfigure(5, weight=1)
+        controls.rowconfigure(6, weight=1)
 
         ttk.Label(log_box, textvariable=self.status_var, wraplength=380).grid(row=0, column=0, sticky="ew")
         self.log_text = tk.Text(log_box, height=14, wrap="word")
@@ -3353,12 +3384,20 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self._show_error(exc)
 
-    def scan_board_from_camera(self) -> None:
+    def scan_board_from_camera(
+        self,
+        force_new: bool = False,
+        freeze_preview: bool = True,
+        assign_to_player: bool = True,
+        switch_after_scan: bool = False,
+    ) -> None:
         try:
             calibration = self._calibration_from_form()
             calibration.validate_ready_for_scan()
 
             def start_scan(frame, source: str, _quality=None) -> None:  # type: ignore[no-untyped-def]
+                if assign_to_player:
+                    self._begin_player_scan(switch_after_scan=switch_after_scan)
                 self._set_status(f"Scanning the calibrated board from the {source}...")
                 self._log(f"Calibrated board scan started from {source}.")
                 thread = threading.Thread(
@@ -3368,7 +3407,7 @@ class ScrabblePlotterApp:
                 )
                 thread.start()
 
-            self._with_camera_ocr_frame("board scan", start_scan)
+            self._with_camera_ocr_frame("board scan", start_scan, force_new=force_new, freeze_preview=freeze_preview)
         except RuntimeError as exc:
             if str(exc) == "Start the camera first.":
                 raise_user_error(str(exc))
@@ -3425,6 +3464,7 @@ class ScrabblePlotterApp:
         on_ready,  # type: ignore[no-untyped-def]
         *,
         force_new: bool = False,
+        freeze_preview: bool = True,
     ) -> None:
         if not force_new and self._captured_photo_frame is not None:
             on_ready(self._captured_photo_frame.copy(), "captured picture", None)
@@ -3435,7 +3475,10 @@ class ScrabblePlotterApp:
 
         def done(result) -> None:  # type: ignore[no-untyped-def]
             frame, quality = result
-            captured = self._store_best_photo_for_ocr(frame, quality, reason)
+            if freeze_preview:
+                captured = self._store_best_photo_for_ocr(frame, quality, reason)
+            else:
+                captured = frame.copy()
             source = f"best camera frame (sharpness {quality.sharpness:.0f})"
             on_ready(captured, source, quality)
 
@@ -3500,8 +3543,14 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self._show_error(exc)
 
-    def identify_words_with_easyocr(self) -> None:
-        if self._camera_word_scan_running:
+    def identify_words_with_easyocr(
+        self,
+        force_new: bool = False,
+        freeze_preview: bool = True,
+        assign_to_player: bool = True,
+        switch_after_scan: bool = False,
+    ) -> None:
+        if not force_new and self._camera_word_scan_running:
             self._set_status("EasyOCR word detection is already running.")
             return
 
@@ -3509,6 +3558,8 @@ class ScrabblePlotterApp:
             confidence_threshold = self._ocr_confidence_threshold()
 
             def start_words(frame, source: str, _quality=None) -> None:  # type: ignore[no-untyped-def]
+                if assign_to_player:
+                    self._begin_player_scan(switch_after_scan=switch_after_scan)
                 self._camera_word_scan_running = True
                 scan_token = self._next_camera_word_scan_token()
                 self._set_status(f"Finding words in the {source} with EasyOCR...")
@@ -3521,7 +3572,7 @@ class ScrabblePlotterApp:
                 )
                 thread.start()
 
-            self._with_camera_ocr_frame("word detection", start_words)
+            self._with_camera_ocr_frame("word detection", start_words, force_new=force_new, freeze_preview=freeze_preview)
         except RuntimeError as exc:
             if str(exc) == "Start the camera first.":
                 raise_user_error(str(exc))
@@ -3732,6 +3783,10 @@ class ScrabblePlotterApp:
             self._try_send_camera_words_to_actuator()
         if self._pending_actuator_challenge_after_word_scan:
             self._finish_pending_actuator_challenge()
+        self._update_grid_colors()
+        if getattr(self, "_pending_turn_scan", False):
+            self._pending_turn_scan = False
+            self._on_turn_scan_complete()
 
     def _handle_camera_word_scan_error(
         self,
@@ -3745,6 +3800,9 @@ class ScrabblePlotterApp:
         if self._pending_actuator_challenge_after_word_scan:
             self._pending_actuator_challenge_after_word_scan = False
         message = str(exc)
+        if getattr(self, "_pending_turn_scan", False):
+            self._pending_turn_scan = False
+            self._turn_scan_switch_after = False
         if announce or self._last_live_word_scan_error != message:
             self._last_live_word_scan_error = message
             self._set_status(f"Word detection paused: {message}")
@@ -3763,14 +3821,23 @@ class ScrabblePlotterApp:
             for col in range(BOARD_SIZE):
                 cell = cells_by_square.get(f"{chr(ord('A') + col)}{row + 1}")
                 letter = cell.letter if cell else ""
-                self._letter_vars[row][col].set(letter)
+                current_val = self._letter_vars[row][col].get().strip().upper()
+                if letter:
+                    self._letter_vars[row][col].set(letter)
+                elif not current_val:
+                    self._letter_vars[row][col].set("")
+
                 entry = self._letter_entries[row][col]
-                if cell is not None and cell.occupied and (not cell.letter or cell.confidence < threshold):
-                    entry.configure(bg="#fff2a8")
-                elif cell is not None and cell.letter:
-                    entry.configure(bg="#e8f7e8")
-                else:
-                    entry.configure(bg="white")
+                label = f"{chr(ord('A') + col)}{row + 1}"
+                # Only update background colors if we are actually modifying or leaving empty
+                if label not in self._player_1_cells and label not in self._player_2_cells:
+                    if cell is not None and cell.occupied and (not cell.letter or cell.confidence < threshold):
+                        if not current_val:
+                            entry.configure(bg="#fff2a8")
+                    elif letter:
+                        entry.configure(bg="#e8f7e8")
+                    elif not current_val:
+                        entry.configure(bg="white")
         self.blank_squares_var.set("")
         self._set_camera_words_text(format_words_by_direction(matched_matrix_words(scan.board_letters())))
         occupied = sum(1 for cell in scan.cells if cell.occupied)
@@ -3778,6 +3845,10 @@ class ScrabblePlotterApp:
         if announce:
             self._handle_score_result(score)
             self._set_status(f"Scanned {recognized} letters from {occupied} occupied cells.")
+        self._update_grid_colors()
+        if getattr(self, "_pending_turn_scan", False):
+            self._pending_turn_scan = False
+            self._on_turn_scan_complete()
             self._log(f"Scan complete: {recognized} recognized, {occupied} occupied.")
         else:
             self._set_status(
@@ -3793,13 +3864,19 @@ class ScrabblePlotterApp:
         for row in range(BOARD_SIZE):
             for col in range(BOARD_SIZE):
                 letter = normalize_letter(board_letters[row][col])
-                self._letter_vars[row][col].set(letter)
+                current_val = self._letter_vars[row][col].get().strip().upper()
                 entry = self._letter_entries[row][col]
+                label = f"{chr(ord('A') + col)}{row + 1}"
+
                 if letter:
+                    self._letter_vars[row][col].set(letter)
                     placed += 1
-                    entry.configure(bg="#e8f7e8")
-                else:
-                    entry.configure(bg="white")
+                    if label not in self._player_1_cells and label not in self._player_2_cells:
+                        entry.configure(bg="#e8f7e8")
+                elif not current_val:
+                    self._letter_vars[row][col].set("")
+                    if label not in self._player_1_cells and label not in self._player_2_cells:
+                        entry.configure(bg="white")
         self._set_camera_words_text(format_words_by_direction(matched_matrix_words(board_letters)))
         return placed
 
@@ -3971,6 +4048,8 @@ class ScrabblePlotterApp:
         self._log(message)
 
     def _maybe_start_live_letter_scan(self, frame) -> None:  # type: ignore[no-untyped-def]
+        if getattr(self, "_pending_turn_scan", False):
+            return
         if not self.live_letter_scan_var.get() or self._live_letter_scan_running:
             return
 
@@ -3995,6 +4074,8 @@ class ScrabblePlotterApp:
         thread.start()
 
     def _maybe_start_live_word_scan(self, frame) -> None:  # type: ignore[no-untyped-def]
+        if getattr(self, "_pending_turn_scan", False):
+            return
         if not self.live_word_scan_var.get() or self._camera_word_scan_running:
             return
 
@@ -4249,6 +4330,8 @@ class ScrabblePlotterApp:
                     responses = sender.send_command(command)
                     for response in responses:
                         if response.lower().startswith("err"):
+                            if "unknown command led_show" in response.lower():
+                                continue
                             raise RuntimeError(f"Board Actuator Arduino error: {response}")
                     results.append((command, responses))
                 return results
@@ -4285,6 +4368,8 @@ class ScrabblePlotterApp:
             self._log("Actuator responses: " + " | ".join(responses))
         for response in responses:
             if response.lower().startswith("err"):
+                if "unknown command led_show" in response.lower():
+                    continue
                 raise RuntimeError(f"Board Actuator Arduino error: {response}")
         return responses
 
@@ -4448,17 +4533,20 @@ class ScrabblePlotterApp:
             if self._has_inline_actuator_test_double():
                 self._send_led_cells_to_actuator(labels, announce=True)
                 return
-            command = self._led_cells_command(labels)
-            if command == "LED_CLEAR":
+            commands = self._led_cells_commands(labels)
+            if not labels:
                 status = "Sent letter lights to the board actuator (0 lit cell(s))."
             else:
                 status = f"Sent letter lights to the board actuator ({len(labels)} lit cell(s))."
-            self._send_actuator_commands_async([command], success_status=status)
+            self._send_actuator_commands_async(commands, success_status=status)
         except Exception as exc:
             self._show_error(exc)
 
     def test_actuator_leds(self) -> None:
         self._send_actuator_button_command("LED_TEST")
+
+    def actuator_win_animation(self) -> None:
+        self._send_actuator_button_command("LED_WIN")
 
     def reveal_actuator_word(self) -> None:
         if self._has_inline_actuator_test_double():
@@ -4555,7 +4643,7 @@ class ScrabblePlotterApp:
         if words:
             commands.append("WORD_LIST " + ",".join(words))
         commands.append("CHALLENGE_START")
-        commands.append(self._led_cells_command(labels))
+        commands.extend(self._led_cells_commands(labels))
         self._send_actuator_commands_async(
             commands,
             success_status=f"Challenge started with {len(labels)} red LED cell(s).",
@@ -4585,21 +4673,27 @@ class ScrabblePlotterApp:
         return labels
 
     def _send_led_cells_to_actuator(self, labels: list[str], announce: bool = True) -> None:
-        command = self._led_cells_command(labels)
-        self._send_actuator_command(command)
+        commands = self._led_cells_commands(labels)
+        for command in commands:
+            self._send_actuator_command(command)
         if announce:
             if labels:
                 self._set_status(f"Sent letter lights to the board actuator ({len(labels)} lit cell(s)).")
             else:
                 self._set_status("Sent letter lights to the board actuator (0 lit cell(s)).")
 
-    def _led_cells_command(self, labels: list[str]) -> str:
+    def _led_cells_commands(self, labels: list[str]) -> list[str]:
         if not labels:
-            return "LED_CLEAR"
-        command = "LED_CELLS " + ",".join(labels)
-        if len(command) >= 180:
-            raise ValueError("Too many detected letter cells to send in one Arduino command.")
-        return command
+            return ["LED_CLEAR"]
+
+        commands = []
+        chunk_size = 40
+        for i in range(0, len(labels), chunk_size):
+            chunk = labels[i : i + chunk_size]
+            cmd = "LED_CELLS " if i == 0 else "LED_APPEND "
+            commands.append(cmd + ",".join(chunk))
+        commands.append("LED_SHOW")
+        return commands
 
     def _try_send_letter_leds_to_actuator(self, announce: bool = False) -> None:
         if not self.actuator_port_var.get().strip():
@@ -4607,7 +4701,7 @@ class ScrabblePlotterApp:
         if not self._has_inline_actuator_test_double():
             try:
                 labels = self._current_led_cell_labels()
-                command = self._led_cells_command(labels)
+                commands = self._led_cells_commands(labels)
                 status = None
                 if announce:
                     if labels:
@@ -4615,7 +4709,7 @@ class ScrabblePlotterApp:
                     else:
                         status = "Sent letter lights to the board actuator (0 lit cell(s))."
                 self._send_actuator_commands_async(
-                    [command],
+                    commands,
                     success_status=status,
                     on_error=lambda exc: self._log(f"Letter lights were not sent to the board actuator: {exc}"),
                 )
@@ -4657,6 +4751,8 @@ class ScrabblePlotterApp:
                     responses = sender.send_command("BOARD_UP")
                     for response in responses:
                         if response.lower().startswith("err"):
+                            if "unknown command led_show" in response.lower():
+                                continue
                             raise RuntimeError(f"Board Actuator Arduino error: {response}")
                     return responses
 
@@ -4929,15 +5025,206 @@ class ScrabblePlotterApp:
             )
         return message
 
+    def _start_game(self) -> None:
+        self._current_player = 1
+        self._player_1_cells.clear()
+        self._player_2_cells.clear()
+        self._player_1_words.clear()
+        self._player_2_words.clear()
+        self._update_words_table()
+        for row in range(BOARD_SIZE):
+            for col in range(BOARD_SIZE):
+                self._letter_vars[row][col].set("")
+        self._previous_board_state.clear()
+        self._turn_start_board_state.clear()
+        self._turn_scan_started_state.clear()
+        self._turn_scan_switch_after = False
+        self._update_grid_colors()
+        self._start_turn()
+
+    def _start_turn(self) -> None:
+        self._current_player_display_var.set(f"Current Player: {self._current_player}")
+        self._turn_start_board_state = dict(self._previous_board_state)
+        import time
+        self._turn_end_time = time.time() + 120.0
+        if not self._timer_running:
+            self._timer_running = True
+            self._update_timer()
+
+    def _update_words_table(self) -> None:
+        if not hasattr(self, "words_table"):
+            return
+        for item in self.words_table.get_children():
+            self.words_table.delete(item)
+        import itertools
+        for p1_word, p2_word in itertools.zip_longest(self._player_1_words, self._player_2_words, fillvalue=""):
+            self.words_table.insert("", "end", values=(p1_word, p2_word))
+
+    def _update_timer(self) -> None:
+        if not self._timer_running:
+            return
+        import time
+        remaining = max(0, int(self._turn_end_time - time.time()))
+        minutes = remaining // 60
+        seconds = remaining % 60
+        self._timer_display_var.set(f"Time Remaining: {minutes}:{seconds:02d}")
+        if remaining <= 0:
+            self._end_turn()
+        else:
+            self._timer_after_id = self.root.after(200, self._update_timer)
+
+    def _end_turn(self) -> None:
+        if not self._timer_running:
+            return
+        self._timer_running = False
+        if self._timer_after_id:
+            self.root.after_cancel(self._timer_after_id)
+            self._timer_after_id = None
+        self._timer_display_var.set("Scanning Board...")
+        self.identify_words_with_easyocr(force_new=True, freeze_preview=False, switch_after_scan=True)
+
+    def _current_player_id(self) -> int:
+        try:
+            player_id = int(getattr(self, "_current_player", 1))
+        except (TypeError, ValueError):
+            player_id = 1
+        if player_id in (1, 2):
+            return player_id
+
+        display_var = getattr(self, "_current_player_display_var", None)
+        try:
+            display_text = str(display_var.get())
+        except Exception:
+            display_text = ""
+        if "2" in display_text:
+            return 2
+        return 1
+
+    def _begin_player_scan(self, switch_after_scan: bool = False) -> int:
+        player_id = self._current_player_id()
+        self._current_player = player_id
+        self._pending_turn_scan = True
+        self._turn_scan_player = player_id
+        self._turn_scan_switch_after = switch_after_scan
+        self._turn_scan_started_state = dict(getattr(self, "_turn_start_board_state", self._previous_board_state))
+        self._log(f"Player {player_id} scan started.")
+        return player_id
+
+    def _current_board_state(self) -> dict[str, str]:
+        state: dict[str, str] = {}
+        for row in range(BOARD_SIZE):
+            for col in range(BOARD_SIZE):
+                val = normalize_letter(self._letter_vars[row][col].get())
+                if val:
+                    state[f"{chr(ord('A') + col)}{row + 1}"] = val
+        return state
+
+    def _assign_new_words_to_current_player(
+        self,
+        player_id: int | None = None,
+        previous_state: dict[str, str] | None = None,
+    ) -> None:
+        if player_id is None:
+            player_id = self._current_player_id()
+        else:
+            try:
+                player_id = int(player_id)
+            except (TypeError, ValueError):
+                player_id = self._current_player_id()
+        if player_id not in (1, 2):
+            player_id = self._current_player_id()
+        if previous_state is None:
+            previous_state = getattr(self, "_turn_scan_started_state", None)
+        if previous_state is None:
+            previous_state = getattr(self, "_previous_board_state", {})
+
+        current_state = self._current_board_state()
+        occupied_cells = set(current_state)
+        for label in (self._player_1_cells | self._player_2_cells) - occupied_cells:
+            self._player_1_cells.discard(label)
+            self._player_2_cells.discard(label)
+
+        owned_cells = self._player_1_cells | self._player_2_cells
+        new_cells = [
+            label
+            for label in current_state
+            if label not in previous_state and label not in owned_cells
+        ]
+
+        if new_cells:
+            self._log(f"Found {len(new_cells)} new placed letters: {', '.join(new_cells)}")
+            score = score_board(
+                self._board_letters_from_form(),
+                premium_layout=self._calibration_from_form().premium_layout,
+                blank_squares=self._blank_squares_from_form(),
+            )
+            new_cells_set = set(new_cells)
+            turn_words = []
+            for word in score.words:
+                if new_cells_set.intersection(word.squares):
+                    if word_matches_reference(word.word):
+                        turn_words.append(word.word)
+
+            if player_id == 1:
+                self._player_1_cells.update(new_cells)
+                if turn_words:
+                    self._player_1_words.extend(turn_words)
+            else:
+                self._player_2_cells.update(new_cells)
+                if turn_words:
+                    self._player_2_words.extend(turn_words)
+            if turn_words:
+                self._update_words_table()
+
+    def _on_turn_scan_complete(self) -> None:
+        self._log("Turn scan completed.")
+        scan_player = getattr(self, "_turn_scan_player", self._current_player_id())
+        try:
+            scan_player = int(scan_player)
+        except (TypeError, ValueError):
+            scan_player = self._current_player_id()
+        if scan_player not in (1, 2):
+            scan_player = self._current_player_id()
+        scan_started_state = getattr(self, "_turn_scan_started_state", self._previous_board_state)
+        self._assign_new_words_to_current_player(scan_player, previous_state=scan_started_state)
+
+        current_state = self._current_board_state()
+
+        self._previous_board_state = current_state
+        self._turn_scan_started_state = dict(current_state)
+        self._update_grid_colors()
+        if getattr(self, "_turn_scan_switch_after", False):
+            if scan_player == 1:
+                self._current_player = 2
+                self._log("Switched to Player 2's turn.")
+            else:
+                self._current_player = 1
+                self._log("Switched to Player 1's turn.")
+            self._turn_scan_switch_after = False
+            self._start_turn()
+        else:
+            self._current_player = scan_player
+            self._turn_start_board_state = dict(current_state)
+            self._turn_scan_switch_after = False
+            self._current_player_display_var.set(f"Current Player: {self._current_player}")
+
+    def _update_grid_colors(self) -> None:
+        for row in range(BOARD_SIZE):
+            for col in range(BOARD_SIZE):
+                label = f"{chr(ord('A') + col)}{row + 1}"
+                entry = self._letter_entries[row][col]
+                if label in self._player_1_cells:
+                    entry.configure(bg="#ADD8E6") # Light Blue
+                elif label in self._player_2_cells:
+                    entry.configure(bg="#FFB6C1") # Light Pink
 
 def _require_cv2():
     try:
-        import cv2  # type: ignore
-    except ImportError as exc:
-        raise RuntimeError(
-            "OpenCV is required for live camera preview. Install scrabble_plotter/requirements.txt."
-        ) from exc
-    return cv2
+        import cv2  # noqa
+
+        return cv2
+    except ImportError:
+        raise_user_error("OpenCV is required for this feature.")
 
 
 def raise_user_error(message: str) -> None:
