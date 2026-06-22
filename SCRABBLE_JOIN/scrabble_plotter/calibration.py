@@ -26,6 +26,12 @@ DEFAULT_OCR_CELL_SIZE_PX = 80
 DEFAULT_ACTUATOR_BAUD = 115200
 DEFAULT_ACTUATOR_TIMEOUT = 2.0
 DEFAULT_ACTUATOR_COUNTDOWN_SECONDS = 30
+MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT = "A1-top-left"
+MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT = "A1-top-right"
+VALID_MACHINE_LABEL_ORIENTATIONS = {
+    MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT,
+    MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT,
+}
 
 
 def _require_cv2():
@@ -42,6 +48,7 @@ def _require_cv2():
 class PlotterCalibration:
     board_size: int = BOARD_SIZE
     label_orientation: str = "A1-top-left"
+    machine_label_orientation: str = MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT
     image_path: str | None = None
     image_corners: list[list[float]] = field(default_factory=list)
     camera_index: int = 0
@@ -89,6 +96,9 @@ class PlotterCalibration:
             raise ValueError("Cell size must be greater than 0.")
         if self.x_steps_per_mm <= 0 or self.y_steps_per_mm <= 0:
             raise ValueError("Stepper scale must be greater than 0.")
+        if self.machine_label_orientation not in VALID_MACHINE_LABEL_ORIENTATIONS:
+            expected = ", ".join(sorted(VALID_MACHINE_LABEL_ORIENTATIONS))
+            raise ValueError(f"Machine label orientation must be one of: {expected}.")
 
     def validate_ready_for_scan(self) -> None:
         if self.board_size != BOARD_SIZE:
@@ -115,9 +125,18 @@ class PlotterCalibration:
 
     def square_center_in_machine(self, square: Square) -> tuple[float, float]:
         pitch_mm = self.cell_size_mm + self.cell_margin_mm
-        x = self.offset_x_mm + square.col * pitch_mm + self.cell_size_mm / 2.0
+        machine_col = self._machine_col_for_square(square)
+        x = self.offset_x_mm + machine_col * pitch_mm + self.cell_size_mm / 2.0
         y = self.offset_y_mm + square.row * pitch_mm + self.cell_size_mm / 2.0
         return (x, y)
+
+    def _machine_col_for_square(self, square: Square) -> int:
+        if self.machine_label_orientation == MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT:
+            return self.board_size - 1 - square.col
+        if self.machine_label_orientation == MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT:
+            return square.col
+        expected = ", ".join(sorted(VALID_MACHINE_LABEL_ORIENTATIONS))
+        raise ValueError(f"Machine label orientation must be one of: {expected}.")
 
     def cart_position_in_machine(self) -> tuple[float, float]:
         return (self.cart_x_mm, self.cart_y_mm)
@@ -126,6 +145,7 @@ class PlotterCalibration:
         return {
             "board_size": self.board_size,
             "label_orientation": self.label_orientation,
+            "machine_label_orientation": self.machine_label_orientation,
             "image_path": self.image_path,
             "image_corners": self.image_corners,
             "camera_index": self.camera_index,
@@ -153,6 +173,10 @@ class PlotterCalibration:
         return cls(
             board_size=int(payload.get("board_size", BOARD_SIZE)),
             label_orientation=payload.get("label_orientation", "A1-top-left"),
+            machine_label_orientation=payload.get(
+                "machine_label_orientation",
+                payload.get("label_orientation", MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT),
+            ),
             image_path=payload.get("image_path"),
             image_corners=payload.get("image_corners", []),
             camera_index=int(payload.get("camera_index", 0)),

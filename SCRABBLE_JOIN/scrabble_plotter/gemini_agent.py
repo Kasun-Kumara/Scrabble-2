@@ -9,6 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from .ai_player import AiMoveCandidate, AiMoveChoice
 from .board import BOARD_SIZE, parse_square_label
 from .calibration import PlotterCalibration
 from .word_bank import (
@@ -47,6 +48,15 @@ WORD_DETECTION_RESPONSE_SCHEMA = {
         },
     },
     "required": ["words"],
+}
+AI_MOVE_CHOICE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string"},
+        "candidate_id": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["action", "reason"],
 }
 
 
@@ -172,6 +182,41 @@ class GeminiPlotterAgent:
         text = _extract_text(response_payload)
         return parse_detected_words(_parse_json_object(text))
 
+    def choose_ai_move(
+        self,
+        candidates: list[AiMoveCandidate],
+        rack_letters: list[str],
+        objective: str = "",
+        timeout: float = 20.0,
+    ) -> AiMoveChoice:
+        if not candidates:
+            return AiMoveChoice(action="pass", reason="No legal moves were available.")
+
+        request_payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": self._build_ai_move_prompt(
+                                candidates,
+                                rack_letters,
+                                objective,
+                            )
+                        }
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+                "responseJsonSchema": AI_MOVE_CHOICE_RESPONSE_SCHEMA,
+            },
+        }
+        response_payload = self._post(request_payload, timeout=timeout)
+        text = _extract_text(response_payload)
+        return AiMoveChoice.from_payload(_parse_json_object(text), candidates)
+
     def _post(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         url = GEMINI_ENDPOINT.format(model=urllib.parse.quote(self.model, safe=""))
         body = json.dumps(payload).encode("utf-8")
@@ -229,6 +274,28 @@ class GeminiPlotterAgent:
             '{"words":[{"word":"WORD","direction":"horizontal_left_to_right","confidence":85}]}\n'
             'If no words are visible, return {"words":[]}.\n'
             f"Local OCR captured these letters as extra context: {local_ocr}"
+        )
+
+    def _build_ai_move_prompt(
+        self,
+        candidates: list[AiMoveCandidate],
+        rack_letters: list[str],
+        objective: str,
+    ) -> str:
+        candidate_payload = [candidate.to_prompt_dict() for candidate in candidates]
+        rack_text = "".join(letter or "-" for letter in rack_letters) or "empty"
+        return (
+            "You are Player 1 in a physical Scrabble-style game. "
+            "Choose exactly one legal move from the candidate list. "
+            "The app has already validated board bounds, rack slots, anchors, cross-words, and plotter safety. "
+            "Do not invent new words, squares, rack slots, G-code, motor steps, or coordinates.\n"
+            "Return exactly one JSON object and no extra text.\n"
+            'To play a move: {"action":"play","candidate_id":"C001","reason":"short reason"}\n'
+            'To pass: {"action":"pass","reason":"short reason"}\n'
+            f"Rack letters by slot TR1-TR7: {rack_text}\n"
+            f"User objective: {objective.strip() or 'Choose the best scoring legal move.'}\n"
+            "Legal candidates, ranked by local score:\n"
+            f"{json.dumps(candidate_payload, separators=(',', ':'))}"
         )
 
 

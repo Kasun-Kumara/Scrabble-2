@@ -8,6 +8,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import ttkbootstrap as tb
 
+from .ai_player import AiMoveCandidate, AiMoveChoice, top_ai_move_candidates
 from .board import BOARD_SIZE, parse_square_label
 from .calibration import PlotterCalibration
 from .camera import open_camera_capture, read_camera_frame
@@ -113,6 +114,10 @@ class ScrabblePlotterApp:
         self.gemini_model_var = tk.StringVar(value="gemini-2.5-flash")
         self.gemini_objective_var = tk.StringVar(value="Choose the next board square.")
         self.gemini_include_camera_var = tk.BooleanVar(value=True)
+        self.player_1_ai_enabled_var = tk.BooleanVar(value=True)
+        self._ai_player_running = False
+        self._ai_turn_after_id: str | None = None
+        self._pending_ai_move_candidate: AiMoveCandidate | None = None
         self.live_letter_scan_var = tk.BooleanVar(value=False)
         self.live_word_scan_var = tk.BooleanVar(value=True)
         self._last_agent_action: PlotterAgentAction | None = None
@@ -151,6 +156,7 @@ class ScrabblePlotterApp:
         self._turn_start_board_state: dict[str, str] = {}
         self._turn_scan_started_state: dict[str, str] = {}
         self._turn_scan_switch_after = False
+        self._turn_scan_detected_words: list[str] = []
 
         self.status_var = tk.StringVar(
             value="Start the camera to find visible words."
@@ -495,13 +501,19 @@ class ScrabblePlotterApp:
         ttk.Label(game_box, textvariable=self._timer_display_var, font=("TkDefaultFont", 10, "bold")).grid(row=0, column=1, sticky="w", pady=2, padx=(10, 0))
         ttk.Button(game_box, text="Start Game", command=self._start_game).grid(row=1, column=0, sticky="ew", pady=4, padx=(0, 4))
         ttk.Button(game_box, text="End Turn", command=self._end_turn).grid(row=1, column=1, sticky="ew", pady=4, padx=(4, 0))
+        ttk.Checkbutton(game_box, text="Player 1 AI", variable=self.player_1_ai_enabled_var).grid(
+            row=2, column=0, sticky="w", pady=4, padx=(0, 4)
+        )
+        ttk.Button(game_box, text="Run AI Now", command=self.run_ai_player_turn).grid(
+            row=2, column=1, sticky="ew", pady=4, padx=(4, 0)
+        )
 
         self.words_table = ttk.Treeview(game_box, columns=("P1", "P2"), show="headings", height=6)
         self.words_table.heading("P1", text="Player 1 Words")
         self.words_table.heading("P2", text="Player 2 Words")
         self.words_table.column("P1", width=140, anchor="center")
         self.words_table.column("P2", width=140, anchor="center")
-        self.words_table.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.words_table.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
         log_box = ttk.LabelFrame(controls, text="Status", padding=10)
         log_box.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
@@ -967,7 +979,10 @@ class ScrabblePlotterApp:
         panel.grid(row=max_row + 1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self._build_tile_rack_letter_grid(panel)
         ttk.Button(panel, text="Suggest Rack Words", command=self.suggest_tile_rack_words).grid(
-            row=7, column=0, columnspan=2, sticky="ew", padx=6, pady=(8, 4)
+            row=7, column=0, sticky="ew", padx=(6, 3), pady=(8, 4)
+        )
+        ttk.Button(panel, text="Clear Rack Letters", command=self.clear_tile_rack_letters).grid(
+            row=7, column=1, sticky="ew", padx=(3, 6), pady=(8, 4)
         )
         ttk.Label(
             panel,
@@ -1709,11 +1724,29 @@ class ScrabblePlotterApp:
             ttk.Label(parent, text=f"TR{index + 1}").grid(row=index, column=0, sticky="e", padx=(6, 4), pady=1)
             entry = ttk.Entry(parent, textvariable=variable, width=4, justify="center")
             entry.grid(row=index, column=1, sticky="w", padx=(0, 6), pady=1)
-            entry.configure(state="readonly")
+            entry.bind("<FocusOut>", lambda _event: self._normalize_tile_rack_letter_entries())
+            entry.bind("<Return>", lambda _event: self._normalize_tile_rack_letter_entries())
+
+    def clear_tile_rack_letters(self) -> None:
+        self._ensure_tile_rack_move_state()
+        for variable in getattr(self, "tile_rack_letter_vars", []):
+            variable.set("")
+        self.tile_rack_word_suggestions_var.set("")
+        self._set_status("Rack letters cleared.")
+
+    def _normalize_tile_rack_letter_entries(self) -> None:
+        self._ensure_tile_rack_move_state()
+        for variable in getattr(self, "tile_rack_letter_vars", []):
+            try:
+                value = variable.get()
+            except Exception:
+                value = ""
+            variable.set(self._tile_rack_letter_from_value(value))
 
     def suggest_tile_rack_words(self) -> None:
         self._ensure_tile_rack_move_state()
         try:
+            self._normalize_tile_rack_letter_entries()
             rack_letters = self._tile_rack_letters_for_word_suggestions()
             if len(rack_letters) < 2:
                 raise ValueError("Detect or enter at least 2 tile rack letters first.")
@@ -1745,11 +1778,16 @@ class ScrabblePlotterApp:
                 value = variable.get()
             except Exception:
                 value = ""
-            for character in str(value).upper():
-                if character.isalpha():
-                    letters.append(character)
-                    break
+            letter = self._tile_rack_letter_from_value(value)
+            if letter:
+                letters.append(letter)
         return letters[:7]
+
+    def _tile_rack_letter_from_value(self, value: object) -> str:
+        for character in str(value).strip().upper():
+            if "A" <= character <= "Z":
+                return character
+        return ""
 
     def _tile_rack_words_from_letters(self, rack_letters: list[str]) -> list[str]:
         from collections import Counter
@@ -2701,10 +2739,12 @@ class ScrabblePlotterApp:
                 continue
         return 1500.0
 
-    def _run_pick_drop_steps(self, steps, board_target: str, index: int = 0) -> None:  # type: ignore[no-untyped-def]
+    def _run_pick_drop_steps(self, steps, board_target: str, index: int = 0, on_complete=None) -> None:  # type: ignore[no-untyped-def]
         if index >= len(steps):
             self._pick_drop_running = False
             self._set_status(f"Picked current tile and dropped on {board_target}.")
+            if on_complete is not None:
+                on_complete()
             return
 
         label, action = steps[index]
@@ -2718,7 +2758,7 @@ class ScrabblePlotterApp:
                 self._show_error(exc)
                 return
             delay_ms = self._pick_drop_step_delay_ms(label)
-            self.root.after(delay_ms, lambda: self._run_pick_drop_steps(steps, board_target, index + 1))
+            self.root.after(delay_ms, lambda: self._run_pick_drop_steps(steps, board_target, index + 1, on_complete=on_complete))
             return
 
         try:
@@ -2733,16 +2773,18 @@ class ScrabblePlotterApp:
             except Exception as exc:
                 self.root.after(0, lambda exc=exc: self._handle_pick_drop_step_error(exc))
                 return
-            self.root.after(0, lambda: self._schedule_next_pick_drop_step(steps, board_target, index, label))
+            self.root.after(0, lambda: self._schedule_next_pick_drop_step(steps, board_target, index, label, on_complete))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _schedule_next_pick_drop_step(self, steps, board_target: str, index: int, label: str) -> None:  # type: ignore[no-untyped-def]
+    def _schedule_next_pick_drop_step(self, steps, board_target: str, index: int, label: str, on_complete=None) -> None:  # type: ignore[no-untyped-def]
         delay_ms = self._pick_drop_step_delay_ms(label)
-        self.root.after(delay_ms, lambda: self._run_pick_drop_steps(steps, board_target, index + 1))
+        self.root.after(delay_ms, lambda: self._run_pick_drop_steps(steps, board_target, index + 1, on_complete=on_complete))
 
     def _handle_pick_drop_step_error(self, exc: Exception) -> None:
         self._pick_drop_running = False
+        self._ai_player_running = False
+        self._pending_ai_move_candidate = None
         self._show_error(exc)
 
     def _pick_drop_step_delay_ms(self, label: str) -> int:
@@ -3763,6 +3805,8 @@ class ScrabblePlotterApp:
             if grid_words:
                 formatted_words = format_words_by_direction(grid_words)
         self._set_camera_words_text(formatted_words)
+        if getattr(self, "_pending_turn_scan", False):
+            self._turn_scan_detected_words = self._camera_words_from_scan(scan)
         if scan.words:
             message = f"EasyOCR matched {len(scan.words)} word(s) from {len(scan.text_boxes)} text box(es)."
             if announce:
@@ -4169,6 +4213,8 @@ class ScrabblePlotterApp:
             detected_words,
             detected_tiles,
             ocr_grid=ocr_grid,
+            show_letters=False,
+            show_word_labels=False,
         )
         display = self._draw_board_pending_corner_overlay(display)
         display = self._draw_tile_rack_grid_overlay(display)
@@ -4567,6 +4613,9 @@ class ScrabblePlotterApp:
         self._send_actuator_button_command("DISPLAY_OFF")
 
     def _camera_challenge_words(self) -> list[str]:
+        return self._camera_words_from_scan(self._last_camera_word_scan, limit=10)
+
+    def _camera_words_from_scan(self, scan: CameraWordScanResult | None, limit: int | None = None) -> list[str]:
         words: list[str] = []
         seen: set[str] = set()
 
@@ -4577,7 +4626,6 @@ class ScrabblePlotterApp:
             seen.add(word)
             words.append(word)
 
-        scan = self._last_camera_word_scan
         if scan is not None:
             for detected in scan.words:
                 add(detected.word)
@@ -4585,7 +4633,9 @@ class ScrabblePlotterApp:
                 for detected in matched_matrix_words(scan.grid.board_letters()):
                     add(detected.word)
 
-        return words[:10]
+        if limit is None:
+            return words
+        return words[:limit]
 
     def _send_camera_words_to_actuator(self, words: list[str]) -> None:
         command = "WORD_LIST " + ",".join(words)
@@ -5027,6 +5077,14 @@ class ScrabblePlotterApp:
 
     def _start_game(self) -> None:
         self._current_player = 1
+        self._ai_player_running = False
+        self._pending_ai_move_candidate = None
+        if getattr(self, "_ai_turn_after_id", None):
+            try:
+                self.root.after_cancel(self._ai_turn_after_id)
+            except Exception:
+                pass
+            self._ai_turn_after_id = None
         self._player_1_cells.clear()
         self._player_2_cells.clear()
         self._player_1_words.clear()
@@ -5039,6 +5097,7 @@ class ScrabblePlotterApp:
         self._turn_start_board_state.clear()
         self._turn_scan_started_state.clear()
         self._turn_scan_switch_after = False
+        self._turn_scan_detected_words.clear()
         self._update_grid_colors()
         self._start_turn()
 
@@ -5050,6 +5109,236 @@ class ScrabblePlotterApp:
         if not self._timer_running:
             self._timer_running = True
             self._update_timer()
+        self._schedule_ai_player_if_needed()
+
+    def _schedule_ai_player_if_needed(self) -> None:
+        if not self._should_auto_run_ai_player():
+            return
+        if getattr(self, "_ai_turn_after_id", None):
+            return
+        root = getattr(self, "root", None)
+        if root is not None and hasattr(root, "after"):
+            self._ai_turn_after_id = root.after(700, self._run_scheduled_ai_player_turn)
+            return
+        self.run_ai_player_turn()
+
+    def _run_scheduled_ai_player_turn(self) -> None:
+        self._ai_turn_after_id = None
+        if self._should_auto_run_ai_player():
+            self.run_ai_player_turn()
+
+    def _should_auto_run_ai_player(self) -> bool:
+        if self._current_player_id() != 1:
+            return False
+        if not self._player_1_ai_enabled():
+            return False
+        if getattr(self, "_ai_player_running", False):
+            return False
+        if getattr(self, "_pick_drop_running", False):
+            return False
+        return True
+
+    def _player_1_ai_enabled(self) -> bool:
+        enabled_var = getattr(self, "player_1_ai_enabled_var", None)
+        if enabled_var is None:
+            return False
+        try:
+            value = enabled_var.get()
+        except Exception:
+            value = enabled_var
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "0", "false", "no", "off"}
+        return bool(value)
+
+    def run_ai_player_turn(self) -> None:
+        try:
+            if self._current_player_id() != 1:
+                self._set_status("Player 1 AI only runs on Player 1's turn.")
+                return
+            if getattr(self, "_ai_player_running", False):
+                self._set_status("Player 1 AI is already running.")
+                return
+            if getattr(self, "_pick_drop_running", False):
+                self._set_status("Wait until the current pick/drop finishes before running the AI.")
+                return
+
+            rack_letters = self._ai_rack_letters()
+            if not any(rack_letters):
+                raise ValueError("Capture tile rack letters before running Player 1 AI.")
+
+            board_letters = self._board_letters_from_form()
+            calibration = self._calibration_from_form()
+            candidates = top_ai_move_candidates(
+                board_letters,
+                rack_letters,
+                premium_layout=calibration.premium_layout,
+            )
+            if not candidates:
+                self._finish_ai_turn_without_move("No legal Player 1 AI moves were available.")
+                return
+
+            self._ai_player_running = True
+            self._set_status(f"Player 1 AI found {len(candidates)} legal move candidate(s). Asking Gemini...")
+            self._log(f"Player 1 AI candidate count sent to Gemini: {len(candidates)}")
+
+            def work() -> AiMoveChoice:
+                agent = GeminiPlotterAgent(
+                    api_key=self.gemini_api_key_var.get(),
+                    model=self.gemini_model_var.get(),
+                )
+                return agent.choose_ai_move(
+                    candidates,
+                    rack_letters,
+                    objective=self.gemini_objective_var.get(),
+                    timeout=max(10.0, float(self.timeout_var.get()) * 10.0),
+                )
+
+            def done(choice: AiMoveChoice) -> None:
+                self._handle_ai_move_choice(choice)
+
+            def on_error(exc: Exception) -> None:
+                self._ai_player_running = False
+                self._pending_ai_move_candidate = None
+                self._show_error(exc)
+
+            self._run_background_task("Asking Gemini to choose Player 1's move...", work, done, on_error)
+        except Exception as exc:
+            self._ai_player_running = False
+            self._pending_ai_move_candidate = None
+            self._show_error(exc)
+
+    def _ai_rack_letters(self) -> list[str]:
+        letters = [""] * 7
+        sources = [
+            getattr(self, "tile_rack_letter_vars", None),
+            getattr(self, "tile_rack_ocr_letter_vars", None),
+        ]
+        for source in sources:
+            if not source:
+                continue
+            for index, variable in enumerate(source[:7]):
+                if index >= 7 or letters[index]:
+                    continue
+                try:
+                    value = variable.get()
+                except Exception:
+                    value = variable
+                letters[index] = self._tile_rack_letter_from_value(value)
+            if any(letters):
+                break
+        return letters
+
+    def _handle_ai_move_choice(self, choice: AiMoveChoice) -> None:
+        if choice.action == "pass":
+            reason = choice.reason or "Gemini passed."
+            self._log(f"Player 1 AI pass: {reason}")
+            self._finish_ai_turn_without_move(reason)
+            return
+
+        candidate = choice.candidate
+        if candidate is None:
+            self._ai_player_running = False
+            self._show_error(RuntimeError("Gemini did not choose a playable candidate."))
+            return
+        if choice.reason:
+            self._log(f"Player 1 AI reason: {choice.reason}")
+        try:
+            self._execute_ai_move_candidate(candidate)
+        except Exception as exc:
+            self._ai_player_running = False
+            self._pending_ai_move_candidate = None
+            self._show_error(exc)
+
+    def _execute_ai_move_candidate(self, candidate: AiMoveCandidate) -> None:
+        if not candidate.placements:
+            raise RuntimeError("AI candidate has no rack tiles to place.")
+        if getattr(self, "_pick_drop_running", False):
+            raise RuntimeError("Pick/drop is already running. Wait until it finishes before starting the AI.")
+
+        self._pending_ai_move_candidate = candidate
+        self._stop_timer_for_ai_player()
+        self._pick_drop_running = True
+        steps = self._ai_pick_drop_steps(candidate)
+        final_square = candidate.placements[-1].square
+        self._set_status(f"Player 1 AI placing {candidate.word} ({candidate.score} pts)...")
+        self._log(
+            "Player 1 AI selected "
+            f"{candidate.candidate_id}: {candidate.word} {candidate.direction} "
+            f"{candidate.start_square}-{candidate.end_square} for {candidate.score} point(s)."
+        )
+        self._run_pick_drop_steps(
+            steps,
+            final_square,
+            on_complete=lambda candidate=candidate: self._finish_ai_move_success(candidate),
+        )
+
+    def _ai_pick_drop_steps(self, candidate: AiMoveCandidate):
+        steps = [("Set Z height", lambda: self._send_pick_drop_ordered_command(self._pick_drop_z_height_command()))]
+        for placement in candidate.placements:
+            pickup = placement.rack_label
+            drop = placement.square
+            steps.extend(
+                [
+                    ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+                    (f"Move to pickup {pickup}", lambda pickup=pickup: self._send_pick_drop_ordered_target_move(pickup)),
+                    ("Z down", lambda: self._send_pick_drop_ordered_command(Z_DOWN_COMMAND)),
+                    ("Magnet on", lambda: self._send_pick_drop_ordered_command("M1")),
+                    ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+                    (f"Move to drop {drop}", lambda drop=drop: self._send_pick_drop_ordered_target_move(drop)),
+                    ("Z down", lambda: self._send_pick_drop_ordered_command(Z_DOWN_COMMAND)),
+                    ("Magnet off", lambda: self._send_pick_drop_ordered_command("M0")),
+                    ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+                ]
+            )
+        return steps
+
+    def _finish_ai_move_success(self, candidate: AiMoveCandidate) -> None:
+        previous_state = dict(getattr(self, "_turn_start_board_state", self._previous_board_state))
+        for placement in candidate.placements:
+            self._letter_vars[placement.row][placement.col].set(placement.letter)
+            self._clear_ai_rack_slot(placement.rack_slot)
+        self._turn_scan_detected_words = [candidate.word, *candidate.cross_words]
+        self._assign_new_words_to_current_player(1, previous_state=previous_state)
+        self._previous_board_state = self._current_board_state()
+        self._turn_start_board_state = dict(self._previous_board_state)
+        self._turn_scan_started_state = dict(self._previous_board_state)
+        self._pending_turn_scan = False
+        self._update_grid_colors()
+        self._pending_ai_move_candidate = None
+        self._ai_player_running = False
+        self._pick_drop_running = False
+        self._set_status(f"Player 1 AI placed {candidate.word}. Switching to Player 2.")
+        self._log(f"Player 1 AI placed {candidate.word} and used {len(candidate.placements)} rack tile(s).")
+        self._current_player = 2
+        self._start_turn()
+
+    def _clear_ai_rack_slot(self, rack_slot: int) -> None:
+        for source_name in ("tile_rack_letter_vars", "tile_rack_ocr_letter_vars"):
+            source = getattr(self, source_name, None)
+            if not source or rack_slot < 1 or rack_slot > len(source):
+                continue
+            try:
+                source[rack_slot - 1].set("")
+            except Exception:
+                pass
+
+    def _finish_ai_turn_without_move(self, reason: str) -> None:
+        self._stop_timer_for_ai_player()
+        self._ai_player_running = False
+        self._pending_ai_move_candidate = None
+        self._set_status(f"Player 1 AI passed. {reason}")
+        self._log(f"Player 1 AI passed. {reason}")
+        self._current_player = 2
+        self._start_turn()
+
+    def _stop_timer_for_ai_player(self) -> None:
+        self._timer_running = False
+        if getattr(self, "_timer_after_id", None):
+            try:
+                self.root.after_cancel(self._timer_after_id)
+            except Exception:
+                pass
+            self._timer_after_id = None
 
     def _update_words_table(self) -> None:
         if not hasattr(self, "words_table"):
@@ -5074,6 +5363,9 @@ class ScrabblePlotterApp:
             self._timer_after_id = self.root.after(200, self._update_timer)
 
     def _end_turn(self) -> None:
+        if getattr(self, "_ai_player_running", False):
+            self._set_status("Player 1 AI is still placing tiles.")
+            return
         if not self._timer_running:
             return
         self._timer_running = False
@@ -5106,6 +5398,7 @@ class ScrabblePlotterApp:
         self._pending_turn_scan = True
         self._turn_scan_player = player_id
         self._turn_scan_switch_after = switch_after_scan
+        self._turn_scan_detected_words = []
         self._turn_scan_started_state = dict(getattr(self, "_turn_start_board_state", self._previous_board_state))
         self._log(f"Player {player_id} scan started.")
         return player_id
@@ -5151,6 +5444,7 @@ class ScrabblePlotterApp:
             if label not in previous_state and label not in owned_cells
         ]
 
+        turn_words = []
         if new_cells:
             self._log(f"Found {len(new_cells)} new placed letters: {', '.join(new_cells)}")
             score = score_board(
@@ -5159,22 +5453,51 @@ class ScrabblePlotterApp:
                 blank_squares=self._blank_squares_from_form(),
             )
             new_cells_set = set(new_cells)
-            turn_words = []
             for word in score.words:
                 if new_cells_set.intersection(word.squares):
                     if word_matches_reference(word.word):
                         turn_words.append(word.word)
 
-            if player_id == 1:
-                self._player_1_cells.update(new_cells)
-                if turn_words:
-                    self._player_1_words.extend(turn_words)
-            else:
-                self._player_2_cells.update(new_cells)
-                if turn_words:
-                    self._player_2_words.extend(turn_words)
-            if turn_words:
-                self._update_words_table()
+        turn_words = self._merge_unique_words(turn_words, getattr(self, "_turn_scan_detected_words", []))
+        if not new_cells and not turn_words:
+            return
+
+        if player_id == 1:
+            self._player_1_cells.update(new_cells)
+            added_words = self._append_new_player_words(self._player_1_words, turn_words)
+        else:
+            self._player_2_cells.update(new_cells)
+            added_words = self._append_new_player_words(self._player_2_words, turn_words)
+        if added_words:
+            self._update_words_table()
+
+    def _merge_unique_words(self, *word_lists: list[str]) -> list[str]:
+        words: list[str] = []
+        seen: set[str] = set()
+        for word_list in word_lists:
+            for value in word_list:
+                word = normalize_word(value)
+                if len(word) < 2 or word in seen:
+                    continue
+                seen.add(word)
+                words.append(word)
+        return words
+
+    def _append_new_player_words(self, target_words: list[str], words: list[str]) -> list[str]:
+        existing = {
+            normalize_word(word)
+            for word in [*self._player_1_words, *self._player_2_words]
+            if normalize_word(word)
+        }
+        added: list[str] = []
+        for value in words:
+            word = normalize_word(value)
+            if len(word) < 2 or word in existing:
+                continue
+            target_words.append(word)
+            existing.add(word)
+            added.append(word)
+        return added
 
     def _on_turn_scan_complete(self) -> None:
         self._log("Turn scan completed.")
@@ -5209,10 +5532,16 @@ class ScrabblePlotterApp:
             self._current_player_display_var.set(f"Current Player: {self._current_player}")
 
     def _update_grid_colors(self) -> None:
+        entries = getattr(self, "_letter_entries", None)
+        if not entries:
+            return
         for row in range(BOARD_SIZE):
             for col in range(BOARD_SIZE):
                 label = f"{chr(ord('A') + col)}{row + 1}"
-                entry = self._letter_entries[row][col]
+                try:
+                    entry = entries[row][col]
+                except (IndexError, TypeError):
+                    continue
                 if label in self._player_1_cells:
                     entry.configure(bg="#ADD8E6") # Light Blue
                 elif label in self._player_2_cells:
