@@ -2728,6 +2728,24 @@ class ScrabblePlotterApp:
     def _send_pick_drop_ordered_board_move(self, square_label: str) -> None:
         self._send_square_move(square_label)
 
+    def _send_pick_drop_ordered_reset(self) -> None:
+        config = self._serial_config()
+
+        def send() -> tuple[str, list[str]]:
+            sender = self._get_sender_for_config(config)
+            return sender.send_reset()
+
+        lock = getattr(self, "_serial_lock", None)
+        if lock is None:
+            command, responses = send()
+        else:
+            with lock:
+                command, responses = send()
+
+        self._log(f"Sent: {command}")
+        if responses:
+            self._log("Responses: " + " | ".join(responses))
+
     def _pick_drop_feed_rate(self) -> float:
         for name in ("feed_rate_var", "feed_var", "plotter_feed_rate_var", "tile_rack_feed_var"):
             source = getattr(self, name, None)
@@ -3998,14 +4016,26 @@ class ScrabblePlotterApp:
         calibration.validate_ready_for_move()
         square = parse_square_label(square_label)
         x, y = calibration.square_center_in_machine(square)
-        sender = self._get_sender()
-        gcode, responses = sender.send_move(
-            x,
-            y,
-            feed_rate=self._optional_float(self.feed_rate_var.get()),
-            command=self.command_var.get().strip() or "G0",
-        )
-        self._set_status(f"Sent {square.label} to {sender.config.port}")
+        feed_rate = self._optional_float(self.feed_rate_var.get())
+        command = self.command_var.get().strip() or "G0"
+
+        lock = getattr(self, "_serial_lock", None)
+        def send() -> tuple[str, list[str]]:
+            sender = self._get_sender()
+            return sender.send_move(
+                x,
+                y,
+                feed_rate=feed_rate,
+                command=command,
+            )
+
+        if lock is None:
+            gcode, responses = send()
+        else:
+            with lock:
+                gcode, responses = send()
+
+        self._set_status(f"Sent {square.label} to Plotter")
         self._log(f"Sent: {gcode}")
         if responses:
             self._log("Responses: " + " | ".join(responses))
@@ -4014,13 +4044,25 @@ class ScrabblePlotterApp:
         calibration = self._calibration_from_form()
         calibration.validate_ready_for_move()
         x, y = calibration.cart_position_in_machine()
-        sender = self._get_sender()
-        gcode, responses = sender.send_move(
-            x,
-            y,
-            feed_rate=self._optional_float(self.feed_rate_var.get()),
-            command=self.command_var.get().strip() or "G0",
-        )
+        feed_rate = self._optional_float(self.feed_rate_var.get())
+        command = self.command_var.get().strip() or "G0"
+
+        lock = getattr(self, "_serial_lock", None)
+        def send() -> tuple[str, list[str]]:
+            sender = self._get_sender()
+            return sender.send_move(
+                x,
+                y,
+                feed_rate=feed_rate,
+                command=command,
+            )
+
+        if lock is None:
+            gcode, responses = send()
+        else:
+            with lock:
+                gcode, responses = send()
+
         self._set_status(f"Sent cart move to X={x:.3f}, Y={y:.3f}")
         self._log(f"Sent: {gcode}")
         if responses:
@@ -4406,8 +4448,25 @@ class ScrabblePlotterApp:
         command = command.strip()
         if not command:
             return []
-        sender = self._get_actuator_sender()
-        responses = sender.send_command(command)
+
+        try:
+            config = self._actuator_config()
+
+            def send() -> list[str]:
+                sender = self._get_actuator_sender_for_config(config)
+                return sender.send_command(command)
+
+            lock = getattr(self, "_serial_lock", None)
+            if lock is None:
+                responses = send()
+            else:
+                with lock:
+                    responses = send()
+
+        except Exception as exc:
+            self._show_error(exc)
+            return []
+
         self._set_status(f"Sent actuator command: {command}")
         self._log(f"Sent actuator command: {command}")
         if responses:
@@ -5033,11 +5092,16 @@ class ScrabblePlotterApp:
         if not command:
             return []
 
+        config_getter = getattr(self, "_serial_config", None)
+        if callable(config_getter):
+            config = config_getter()
+        else:
+            config = None
+
         def send() -> list[str]:
-            config_getter = getattr(self, "_serial_config", None)
             sender_for_config = getattr(self, "_get_sender_for_config", None)
-            if callable(config_getter) and callable(sender_for_config):
-                return sender_for_config(config_getter()).send_command(command, startup_g90=False)
+            if config is not None and callable(sender_for_config):
+                return sender_for_config(config).send_command(command, startup_g90=False)
             sender = self._get_sender()
             return sender.send_command(command, startup_g90=False)
 
@@ -5290,6 +5354,7 @@ class ScrabblePlotterApp:
                     ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
                 ]
             )
+        steps.append(("Reset to start", lambda: self._send_pick_drop_ordered_reset()))
         return steps
 
     def _finish_ai_move_success(self, candidate: AiMoveCandidate) -> None:

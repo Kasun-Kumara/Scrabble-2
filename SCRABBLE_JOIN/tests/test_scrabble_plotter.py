@@ -1518,6 +1518,7 @@ class AiPlayerGuiTests(unittest.TestCase):
         app.calls = []
         app._send_pick_drop_ordered_command = lambda command: app.calls.append(("command", command))
         app._send_pick_drop_ordered_target_move = lambda target: app.calls.append(("move", target))
+        app._send_pick_drop_ordered_reset = lambda: app.calls.append(("reset", "HOMEZERO"))
 
         steps = ScrabblePlotterApp._ai_pick_drop_steps(app, self._candidate())
         for _label, action in steps:
@@ -1554,6 +1555,7 @@ class AiPlayerGuiTests(unittest.TestCase):
                 ("command", Z_DOWN_COMMAND),
                 ("command", "M0"),
                 ("command", Z_UP_COMMAND),
+                ("reset", "HOMEZERO"),
             ],
         )
 
@@ -1620,6 +1622,30 @@ class AiPlayerGuiTests(unittest.TestCase):
 
         self.assertEqual([variable.get() for variable in app.tile_rack_letter_vars], ["C", "A", "", "T", "", "Z", "Q"])
         self.assertEqual(ScrabblePlotterApp._ai_rack_letters(app), ["C", "A", "", "T", "", "Z", "Q"])
+
+    def test_rack_scan_updates_visible_tile_rack_grid(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_rack_letter_vars = [_FakeVar("") for _ in range(7)]
+        app.tile_rack_word_suggestions_var = _FakeVar("")
+        app.tile_rack_status_var = _FakeVar("")
+        app._tile_rack_move_state_ready = True
+        app._tile_rack_calibrated_corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 70.0), (0.0, 70.0)]
+        app._tile_rack_letters_from_camera = lambda frame, scan: ["C", "A", "T", "", "", "", ""]
+        app._tile_rack_slot_position = lambda index: (100.0, 20.0 + index)
+        app.logs = []
+        app._log = app.logs.append
+        app._refresh_camera_preview = lambda: None
+
+        count = ScrabblePlotterApp._update_tile_rack_letters_from_scan(
+            app,
+            object(),
+            CameraLetterScanResult(letters=[], grid=None),
+            source="test scan",
+        )
+
+        self.assertEqual(count, 3)
+        self.assertEqual([variable.get() for variable in app.tile_rack_letter_vars[:3]], ["C", "A", "T"])
+        self.assertIn("TR1: C", app.tile_rack_status_var.get())
 
     def test_clear_manual_rack_letters(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
