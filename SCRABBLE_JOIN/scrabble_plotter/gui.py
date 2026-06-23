@@ -4,16 +4,18 @@ import os
 import threading
 import time
 import tkinter as tk
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-import ttkbootstrap as tb
 
 from .ai_player import AiMoveCandidate, AiMoveChoice, top_ai_move_candidates
 from .board import BOARD_SIZE, parse_square_label
 from .calibration import PlotterCalibration
 from .camera import open_camera_capture, read_camera_frame
-from .gemini_agent import (
-    GeminiPlotterAgent,
+from .openai_agent import (
+    DEFAULT_OPENAI_ENDPOINT,
+    OpenAIPlotterAgent,
     PlotterAgentAction,
 )
 from .image_calibration import collect_board_corners_from_frame
@@ -50,6 +52,7 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CALIBRATION_PATH = APP_ROOT / "scrabble_plotter_calibration.json"
 LIVE_LETTER_SCAN_INTERVAL_SECONDS = 4.0
 LIVE_WORD_SCAN_INTERVAL_SECONDS = 4.0
+LIVE_TILE_RACK_SCAN_INTERVAL_SECONDS = 2.0
 BEST_CAPTURE_FRAME_COUNT = 18
 BEST_CAPTURE_TIMEOUT_SECONDS = 1.0
 BEST_CAPTURE_FRAME_DELAY_SECONDS = 0.025
@@ -82,6 +85,7 @@ class ScrabblePlotterApp:
         self._calibration = PlotterCalibration.load(self.calibration_path.get())
 
         self.camera_index_var = tk.StringVar(value=str(self._calibration.camera_index))
+        self.tile_rack_camera_index_var = tk.StringVar(value=str(self._calibration.tile_rack_camera_index))
         self.offset_x_var = tk.StringVar(value=str(self._calibration.offset_x_mm))
         self.offset_y_var = tk.StringVar(value=str(self._calibration.offset_y_mm))
         self.cell_size_var = tk.StringVar(value=str(self._calibration.cell_size_mm))
@@ -110,16 +114,22 @@ class ScrabblePlotterApp:
             value=str(self._calibration.actuator_countdown_seconds)
         )
         self.actuator_word_var = tk.StringVar(value="")
-        self.gemini_api_key_var = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", ""))
-        self.gemini_model_var = tk.StringVar(value="gemini-2.5-flash")
-        self.gemini_objective_var = tk.StringVar(value="Choose the next board square.")
-        self.gemini_include_camera_var = tk.BooleanVar(value=True)
+        self.tile_cart_url_var = tk.StringVar(value=self._calibration.tile_cart_url)
+        self.tile_cart_player_1_command_var = tk.StringVar(value=self._calibration.tile_cart_player_1_command)
+        self.tile_cart_player_2_command_var = tk.StringVar(value=self._calibration.tile_cart_player_2_command)
+        self.tile_cart_enabled_var = tk.BooleanVar(value=True)
+        self.openai_endpoint_var = tk.StringVar(value=os.environ.get("OPENAI_ENDPOINT", DEFAULT_OPENAI_ENDPOINT))
+        self.openai_api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
+        self.openai_model_var = tk.StringVar(value=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
+        self.openai_objective_var = tk.StringVar(value="Choose the next board square.")
+        self.openai_include_camera_var = tk.BooleanVar(value=True)
         self.player_1_ai_enabled_var = tk.BooleanVar(value=True)
         self._ai_player_running = False
         self._ai_turn_after_id: str | None = None
         self._pending_ai_move_candidate: AiMoveCandidate | None = None
         self.live_letter_scan_var = tk.BooleanVar(value=False)
         self.live_word_scan_var = tk.BooleanVar(value=True)
+        self.live_tile_rack_scan_var = tk.BooleanVar(value=True)
         self._last_agent_action: PlotterAgentAction | None = None
         self.blank_squares_var = tk.StringVar()
         self.captured_letters_var = tk.StringVar()
@@ -157,6 +167,8 @@ class ScrabblePlotterApp:
         self._turn_scan_started_state: dict[str, str] = {}
         self._turn_scan_switch_after = False
         self._turn_scan_detected_words: list[str] = []
+        self._tile_cart_player_position: int | None = None
+        self._tile_cart_move_running = False
 
         self.status_var = tk.StringVar(
             value="Start the camera to find visible words."
@@ -172,6 +184,14 @@ class ScrabblePlotterApp:
         self._camera_failed_reads = 0
         self._camera_letter_scan_token = 0
         self._camera_word_scan_token = 0
+        self._tile_rack_camera = None
+        self._tile_rack_camera_lock = threading.Lock()
+        self._tile_rack_camera_worker_running = False
+        self._tile_rack_latest_frame = None
+        self._tile_rack_camera_failed_reads = 0
+        self._tile_rack_live_scan_running = False
+        self._last_live_tile_rack_scan_at = 0.0
+        self._last_live_tile_rack_scan_error: str | None = None
         self._last_live_letter_scan_at = 0.0
         self._live_letter_scan_running = False
         self._last_live_letter_scan_error: str | None = None
@@ -468,14 +488,15 @@ class ScrabblePlotterApp:
             row=9, column=0, sticky="ew", pady=(10, 0)
         )
 
-        agent_box = ttk.LabelFrame(controls, text="Gemini Agent", padding=10)
+        agent_box = ttk.LabelFrame(controls, text="OpenAI Agent", padding=10)
         agent_box.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         agent_box.columnconfigure(1, weight=1)
 
         agent_fields = [
-            ("API Key", self.gemini_api_key_var),
-            ("Model", self.gemini_model_var),
-            ("Objective", self.gemini_objective_var),
+            ("Endpoint", self.openai_endpoint_var),
+            ("API Key", self.openai_api_key_var),
+            ("Model", self.openai_model_var),
+            ("Objective", self.openai_objective_var),
         ]
         for index, (label, variable) in enumerate(agent_fields):
             ttk.Label(agent_box, text=label).grid(row=index, column=0, sticky="w", pady=2)
@@ -484,14 +505,14 @@ class ScrabblePlotterApp:
                 row=index, column=1, columnspan=2, sticky="ew", padx=(8, 0)
             )
 
-        ttk.Checkbutton(agent_box, text="Use latest camera frame", variable=self.gemini_include_camera_var).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        ttk.Checkbutton(agent_box, text="Use latest camera frame", variable=self.openai_include_camera_var).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(8, 0)
         )
-        ttk.Button(agent_box, text="Ask Gemini", command=self.ask_gemini).grid(
-            row=4, column=0, columnspan=3, sticky="ew", pady=(10, 6)
+        ttk.Button(agent_box, text="Ask OpenAI", command=self.ask_openai).grid(
+            row=5, column=0, columnspan=3, sticky="ew", pady=(10, 6)
         )
-        ttk.Button(agent_box, text="Run Gemini Action", command=self.run_gemini_action).grid(
-            row=5, column=0, columnspan=3, sticky="ew"
+        ttk.Button(agent_box, text="Run OpenAI Action", command=self.run_openai_action).grid(
+            row=6, column=0, columnspan=3, sticky="ew"
         )
 
         game_box = ttk.LabelFrame(controls, text="Game State", padding=10)
@@ -508,12 +529,33 @@ class ScrabblePlotterApp:
             row=2, column=1, sticky="ew", pady=4, padx=(4, 0)
         )
 
+        cart_box = ttk.LabelFrame(game_box, text="Tile Cart", padding=8)
+        cart_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        cart_box.columnconfigure(1, weight=1)
+        ttk.Checkbutton(cart_box, text="Move cart each turn", variable=self.tile_cart_enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4)
+        )
+        cart_fields = [
+            ("URL", self.tile_cart_url_var),
+            ("Player 1 command", self.tile_cart_player_1_command_var),
+            ("Player 2 command", self.tile_cart_player_2_command_var),
+        ]
+        for index, (label, variable) in enumerate(cart_fields, start=1):
+            ttk.Label(cart_box, text=label).grid(row=index, column=0, sticky="w", pady=2)
+            ttk.Entry(cart_box, textvariable=variable).grid(row=index, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Button(cart_box, text="Move To Player", command=self.move_tile_cart_to_current_player).grid(
+            row=4, column=0, sticky="ew", pady=(6, 0), padx=(0, 4)
+        )
+        ttk.Button(cart_box, text="Stop Cart", command=lambda: self.send_tile_cart_command("stop")).grid(
+            row=4, column=1, sticky="ew", pady=(6, 0), padx=(4, 0)
+        )
+
         self.words_table = ttk.Treeview(game_box, columns=("P1", "P2"), show="headings", height=6)
         self.words_table.heading("P1", text="Player 1 Words")
         self.words_table.heading("P2", text="Player 2 Words")
         self.words_table.column("P1", width=140, anchor="center")
         self.words_table.column("P2", width=140, anchor="center")
-        self.words_table.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.words_table.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
 
         log_box = ttk.LabelFrame(controls, text="Status", padding=10)
         log_box.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
@@ -603,6 +645,7 @@ class ScrabblePlotterApp:
     def load_calibration_into_form(self) -> None:
         self._calibration = PlotterCalibration.load(self.calibration_path.get())
         self.camera_index_var.set(str(self._calibration.camera_index))
+        self.tile_rack_camera_index_var.set(str(self._calibration.tile_rack_camera_index))
         self.offset_x_var.set(str(self._calibration.offset_x_mm))
         self.offset_y_var.set(str(self._calibration.offset_y_mm))
         self.cell_size_var.set(str(self._calibration.cell_size_mm))
@@ -619,6 +662,9 @@ class ScrabblePlotterApp:
         self.actuator_baud_var.set(str(self._calibration.actuator_baud))
         self.actuator_timeout_var.set(str(self._calibration.actuator_timeout))
         self.actuator_countdown_seconds_var.set(str(self._calibration.actuator_countdown_seconds))
+        self.tile_cart_url_var.set(self._calibration.tile_cart_url)
+        self.tile_cart_player_1_command_var.set(self._calibration.tile_cart_player_1_command)
+        self.tile_cart_player_2_command_var.set(self._calibration.tile_cart_player_2_command)
         self._load_premium_layout_into_form()
         if len(self._calibration.image_corners) == 4:
             self._set_status("Loaded board calibration. Start the camera to find visible words.")
@@ -774,6 +820,127 @@ class ScrabblePlotterApp:
             self.preview_image = None
             self._preview_display_size = (0, 0)
             self._preview_source_size = (0, 0)
+
+    def start_tile_rack_camera(self) -> None:
+        try:
+            cv2 = _require_cv2()
+            self.stop_tile_rack_camera()
+            camera_index = int(self.tile_rack_camera_index_var.get())
+            calibration = self._calibration_from_form()
+
+            def work():  # type: ignore[no-untyped-def]
+                return open_camera_capture(cv2, camera_index)
+
+            def done(opened_camera) -> None:  # type: ignore[no-untyped-def]
+                self._tile_rack_camera = opened_camera.capture
+                self._calibration = calibration
+                self._calibration.tile_rack_camera_index = camera_index
+                self._calibration.save(self.calibration_path.get())
+                self._tile_rack_latest_frame = opened_camera.first_frame.copy()
+                self._tile_rack_camera_failed_reads = 0
+                self._tile_rack_live_scan_running = False
+                self._last_live_tile_rack_scan_at = 0.0
+                self._last_live_tile_rack_scan_error = None
+                self._set_status(f"Rack camera {camera_index} started ({opened_camera.backend_name}).")
+                self._start_tile_rack_camera_worker_thread()
+
+            self._run_background_task(f"Starting rack camera {camera_index}...", work, done)
+        except Exception as exc:
+            self._show_error(exc)
+
+    def stop_tile_rack_camera(self) -> None:
+        self._tile_rack_camera_worker_running = False
+        camera = getattr(self, "_tile_rack_camera", None)
+        if camera is not None:
+            lock = getattr(self, "_tile_rack_camera_lock", None)
+            if lock is None:
+                camera.release()
+            else:
+                with lock:
+                    camera.release()
+            self._tile_rack_camera = None
+        self._tile_rack_latest_frame = None
+        self._tile_rack_camera_failed_reads = 0
+        self._tile_rack_live_scan_running = False
+
+    def _start_tile_rack_camera_worker_thread(self) -> None:
+        self._tile_rack_camera_worker_running = True
+        threading.Thread(target=self._tile_rack_camera_worker_loop, daemon=True).start()
+
+    def _tile_rack_camera_worker_loop(self) -> None:
+        while getattr(self, "_tile_rack_camera_worker_running", False):
+            if self._tile_rack_camera is None:
+                time.sleep(0.03)
+                continue
+
+            with self._tile_rack_camera_lock:
+                frame = read_camera_frame(self._tile_rack_camera)
+
+            if frame is not None:
+                self._tile_rack_camera_failed_reads = 0
+                self._tile_rack_latest_frame = frame
+                self._maybe_start_live_tile_rack_scan(frame)
+            else:
+                self._tile_rack_camera_failed_reads += 1
+                if self._tile_rack_camera_failed_reads >= CAMERA_READ_FAILURE_LIMIT:
+                    self.root.after(0, self._handle_tile_rack_camera_frame_loss)
+                    break
+
+            time.sleep(0.03)
+
+    def _handle_tile_rack_camera_frame_loss(self) -> None:
+        message = (
+            "Rack camera stopped because no video frames were available. "
+            "Try another camera number or close other apps using that camera."
+        )
+        self.stop_tile_rack_camera()
+        self._set_status(message)
+        self._log(message)
+
+    def _maybe_start_live_tile_rack_scan(self, frame) -> None:  # type: ignore[no-untyped-def]
+        if not self.live_tile_rack_scan_var.get() or self._tile_rack_live_scan_running:
+            return
+        now = time.monotonic()
+        if now - self._last_live_tile_rack_scan_at < LIVE_TILE_RACK_SCAN_INTERVAL_SECONDS:
+            return
+        try:
+            confidence_threshold = self._ocr_confidence_threshold()
+        except Exception as exc:
+            self._handle_tile_rack_live_scan_error(exc)
+            return
+        self._last_live_tile_rack_scan_at = now
+        self._tile_rack_live_scan_running = True
+        threading.Thread(
+            target=self._tile_rack_live_scan_worker,
+            args=(frame.copy(), confidence_threshold),
+            daemon=True,
+        ).start()
+
+    def _tile_rack_live_scan_worker(self, frame, confidence_threshold: float) -> None:  # type: ignore[no-untyped-def]
+        try:
+            scan = scan_camera_letters(frame, confidence_threshold=confidence_threshold)
+            self.root.after(0, lambda: self._handle_tile_rack_live_scan_result(frame, scan))
+        except Exception as exc:
+            self.root.after(0, lambda exc=exc: self._handle_tile_rack_live_scan_error(exc))
+
+    def _handle_tile_rack_live_scan_result(self, frame, scan: CameraLetterScanResult) -> None:  # type: ignore[no-untyped-def]
+        self._tile_rack_live_scan_running = False
+        self._last_live_tile_rack_scan_error = None
+        letters = self._tile_rack_letters_from_brown_grid(frame, scan)
+        self._set_tile_rack_ocr_letters(letters)
+        self._set_main_tile_rack_letters(letters, source="rack camera")
+        detected_count = len([letter for letter in letters if letter])
+        self._set_status(f"Live rack camera detected {detected_count} tile rack letter(s).")
+
+    def _handle_tile_rack_live_scan_error(self, exc: Exception) -> None:
+        self._tile_rack_live_scan_running = False
+        message = str(exc)
+        if self._last_live_tile_rack_scan_error != message:
+            self._last_live_tile_rack_scan_error = message
+            self._set_status(f"Rack camera OCR paused: {message}")
+            self._log(f"Rack camera OCR paused: {message}")
+        if "easyocr" in message.lower():
+            self.live_tile_rack_scan_var.set(False)
 
     def calibrate_board_from_camera(self) -> None:
         if self._latest_frame is None:
@@ -977,12 +1144,32 @@ class ScrabblePlotterApp:
 
         panel = ttk.LabelFrame(parent, text="Tile Rack Letters")
         panel.grid(row=max_row + 1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        self._build_tile_rack_letter_grid(panel)
+        rack_camera_controls = ttk.Frame(panel)
+        rack_camera_controls.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 2))
+        ttk.Label(rack_camera_controls, text="Rack Camera").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            rack_camera_controls,
+            textvariable=self.tile_rack_camera_index_var,
+            values=[str(index) for index in range(6)],
+            width=6,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 6))
+        ttk.Button(rack_camera_controls, text="Start", command=self.start_tile_rack_camera).grid(
+            row=0, column=2, padx=(0, 6)
+        )
+        ttk.Button(rack_camera_controls, text="Stop", command=self.stop_tile_rack_camera).grid(
+            row=0, column=3, padx=(0, 6)
+        )
+        ttk.Checkbutton(
+            rack_camera_controls,
+            text="Live rack",
+            variable=self.live_tile_rack_scan_var,
+        ).grid(row=0, column=4, sticky="w")
+        self._build_tile_rack_letter_grid(panel, start_row=1)
         ttk.Button(panel, text="Suggest Rack Words", command=self.suggest_tile_rack_words).grid(
-            row=7, column=0, sticky="ew", padx=(6, 3), pady=(8, 4)
+            row=8, column=0, sticky="ew", padx=(6, 3), pady=(8, 4)
         )
         ttk.Button(panel, text="Clear Rack Letters", command=self.clear_tile_rack_letters).grid(
-            row=7, column=1, sticky="ew", padx=(3, 6), pady=(8, 4)
+            row=8, column=1, sticky="ew", padx=(3, 6), pady=(8, 4)
         )
         ttk.Label(
             panel,
@@ -990,7 +1177,7 @@ class ScrabblePlotterApp:
             anchor="nw",
             justify="left",
             wraplength=260,
-        ).grid(row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ).grid(row=9, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
         self._tile_rack_letters_panel_installed = True
 
     def _install_board_cell_margin_feature(self) -> None:
@@ -1718,12 +1905,13 @@ class ScrabblePlotterApp:
             x_var.set(f"{float(x):.0f}")
             y_var.set(f"{float(y):.0f}")
 
-    def _build_tile_rack_letter_grid(self, parent) -> None:  # type: ignore[no-untyped-def]
+    def _build_tile_rack_letter_grid(self, parent, start_row: int = 0) -> None:  # type: ignore[no-untyped-def]
         self._ensure_tile_rack_move_state()
         for index, variable in enumerate(self.tile_rack_letter_vars):
-            ttk.Label(parent, text=f"TR{index + 1}").grid(row=index, column=0, sticky="e", padx=(6, 4), pady=1)
+            row = start_row + index
+            ttk.Label(parent, text=f"TR{index + 1}").grid(row=row, column=0, sticky="e", padx=(6, 4), pady=1)
             entry = ttk.Entry(parent, textvariable=variable, width=4, justify="center")
-            entry.grid(row=index, column=1, sticky="w", padx=(0, 6), pady=1)
+            entry.grid(row=row, column=1, sticky="w", padx=(0, 6), pady=1)
             entry.bind("<FocusOut>", lambda _event: self._normalize_tile_rack_letter_entries())
             entry.bind("<Return>", lambda _event: self._normalize_tile_rack_letter_entries())
 
@@ -1977,6 +2165,13 @@ class ScrabblePlotterApp:
     def capture_tile_rack_letters(self) -> None:
         self._ensure_tile_rack_move_state()
         try:
+            rack_frame = getattr(self, "_tile_rack_latest_frame", None)
+            if rack_frame is not None:
+                frame = rack_frame.copy()
+                source = "rack camera"
+                self._start_tile_rack_letters_scan(frame, source, None)
+                return
+
             live_frame = getattr(self, "_last_displayed_camera_frame_for_ocr", None)
             if live_frame is None:
                 live_frame = getattr(self, "_latest_frame", None)
@@ -3182,6 +3377,26 @@ class ScrabblePlotterApp:
             letter = letters[index] if index < len(letters) and letters[index] else ""
             self.tile_rack_ocr_letter_vars[index].set(letter)
 
+    def _set_main_tile_rack_letters(self, letters: list[str], source: str = "rack OCR") -> int:
+        self._ensure_tile_rack_move_state()
+        detected_count = 0
+        lines = []
+        for index, variable in enumerate(self.tile_rack_letter_vars):
+            letter = letters[index] if index < len(letters) and letters[index] else ""
+            variable.set(letter)
+            if letter:
+                detected_count += 1
+            x, y = self._tile_rack_slot_position(index)
+            lines.append(f"TR{index + 1}: {letter or '-'}  X{x:g} Y{y:g}")
+
+        result = "\n".join(lines)
+        self.tile_rack_status_var.set(result)
+        self._log(f"Tile rack letters from {source}:\n" + result)
+        refresh = getattr(self, "_refresh_camera_preview", None)
+        if callable(refresh):
+            refresh()
+        return detected_count
+
     def _clear_tile_rack_ocr_letters(self) -> None:
         self._ensure_tile_rack_position_state()
         for variable in self.tile_rack_ocr_letter_vars:
@@ -3616,6 +3831,7 @@ class ScrabblePlotterApp:
 
         try:
             confidence_threshold = self._ocr_confidence_threshold()
+            calibration = self._calibration_from_form()
 
             def start_words(frame, source: str, _quality=None) -> None:  # type: ignore[no-untyped-def]
                 if assign_to_player:
@@ -3627,7 +3843,7 @@ class ScrabblePlotterApp:
                 self._log(f"EasyOCR word detection started from {source}.")
                 thread = threading.Thread(
                     target=self._camera_word_scan_worker,
-                    args=(frame.copy(), confidence_threshold, True, scan_token),
+                    args=(frame.copy(), confidence_threshold, True, scan_token, calibration),
                     daemon=True,
                 )
                 thread.start()
@@ -3645,7 +3861,7 @@ class ScrabblePlotterApp:
     def identify_words_with_paddleocr(self) -> None:
         self.identify_words_with_easyocr()
 
-    def identify_words_with_gemini(self) -> None:
+    def identify_words_with_openai(self) -> None:
         self.identify_words_with_easyocr()
 
     def calculate_score_from_board(self) -> None:
@@ -3663,15 +3879,15 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self._show_error(exc)
 
-    def ask_gemini(self) -> None:
+    def ask_openai(self) -> None:
         try:
             calibration = self._calibration_from_form()
             calibration.validate_ready_for_move()
-            image_jpeg = self._latest_camera_jpeg() if self.gemini_include_camera_var.get() else None
-            self._set_status("Asking Gemini for the next plotter action...")
-            self._log("Gemini request started.")
+            image_jpeg = self._latest_camera_jpeg() if self.openai_include_camera_var.get() else None
+            self._set_status("Asking OpenAI for the next plotter action...")
+            self._log("OpenAI request started.")
             thread = threading.Thread(
-                target=self._ask_gemini_worker,
+                target=self._ask_openai_worker,
                 args=(calibration, image_jpeg),
                 daemon=True,
             )
@@ -3679,10 +3895,10 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self._show_error(exc)
 
-    def run_gemini_action(self) -> None:
+    def run_openai_action(self) -> None:
         try:
             if self._last_agent_action is None:
-                self.ask_gemini()
+                self.ask_openai()
                 return
             self._execute_agent_action(self._last_agent_action)
             self._last_agent_action = None
@@ -3730,9 +3946,11 @@ class ScrabblePlotterApp:
         confidence_threshold: float,
         announce: bool,
         scan_token: int,
+        calibration: PlotterCalibration | None = None,
     ) -> None:  # type: ignore[no-untyped-def]
         try:
-            scan = scan_camera_words(frame, confidence_threshold=confidence_threshold)
+            board_frame = self._frame_limited_to_calibrated_board(frame, calibration=calibration)
+            scan = scan_camera_words(board_frame, confidence_threshold=confidence_threshold)
             self.root.after(
                 0,
                 lambda: self._handle_camera_word_scan_result(scan, announce=announce, scan_token=scan_token),
@@ -3946,14 +4164,15 @@ class ScrabblePlotterApp:
         self._set_status(f"Board score: {score.total_score}")
         self._log(self._format_score_result(score))
 
-    def _ask_gemini_worker(self, calibration: PlotterCalibration, image_jpeg: bytes | None) -> None:
+    def _ask_openai_worker(self, calibration: PlotterCalibration, image_jpeg: bytes | None) -> None:
         try:
-            agent = GeminiPlotterAgent(
-                api_key=self.gemini_api_key_var.get(),
-                model=self.gemini_model_var.get(),
+            agent = OpenAIPlotterAgent(
+                endpoint=self.openai_endpoint_var.get(),
+                api_key=self.openai_api_key_var.get(),
+                model=self.openai_model_var.get(),
             )
             action = agent.decide(
-                self.gemini_objective_var.get(),
+                self.openai_objective_var.get(),
                 calibration,
                 image_jpeg=image_jpeg,
                 timeout=max(5.0, float(self.timeout_var.get()) * 10.0),
@@ -3965,10 +4184,10 @@ class ScrabblePlotterApp:
     def _handle_agent_action(self, action: PlotterAgentAction) -> None:
         self._last_agent_action = action
         summary = self._format_agent_action(action)
-        self._set_status(f"Gemini chose: {summary}")
-        self._log(f"Gemini chose: {summary}")
+        self._set_status(f"OpenAI chose: {summary}")
+        self._log(f"OpenAI chose: {summary}")
         if action.reason:
-            self._log(f"Gemini reason: {action.reason}")
+            self._log(f"OpenAI reason: {action.reason}")
 
     def _execute_agent_action(self, action: PlotterAgentAction) -> None:
         if action.action == "move_square" and action.square:
@@ -3981,8 +4200,8 @@ class ScrabblePlotterApp:
         if action.action == "reset":
             self.reset_to_start()
             return
-        self._set_status("Gemini chose no movement.")
-        self._log("Gemini action: none")
+        self._set_status("OpenAI chose no movement.")
+        self._log("OpenAI action: none")
 
     def _format_agent_action(self, action: PlotterAgentAction) -> str:
         if action.action == "move_square" and action.square:
@@ -4000,7 +4219,7 @@ class ScrabblePlotterApp:
         cv2 = _require_cv2()
         ok, encoded = cv2.imencode(".jpg", frame)
         if not ok:
-            raise RuntimeError("Could not encode the current camera frame for Gemini.")
+            raise RuntimeError("Could not encode the current camera frame for OpenAI.")
         return encoded.tobytes()
 
     def _send_square_move(self, square_label: str) -> None:
@@ -4180,10 +4399,31 @@ class ScrabblePlotterApp:
         scan_token = self._next_camera_word_scan_token()
         thread = threading.Thread(
             target=self._camera_word_scan_worker,
-            args=(frame.copy(), confidence_threshold, False, scan_token),
+            args=(frame.copy(), confidence_threshold, False, scan_token, getattr(self, "_calibration", None)),
             daemon=True,
         )
         thread.start()
+
+    def _frame_limited_to_calibrated_board(
+        self,
+        frame,
+        calibration: PlotterCalibration | None = None,
+    ):  # type: ignore[no-untyped-def]
+        calibration = calibration or getattr(self, "_calibration", None)
+        corners = getattr(calibration, "image_corners", None)
+        if not corners or len(corners) != 4:
+            raise ValueError("Calibrate the board before word detection so only the board area is scanned.")
+
+        cv2 = _require_cv2()
+        import numpy as np
+
+        limited = frame.copy()
+        mask = np.zeros(limited.shape[:2], dtype=np.uint8)
+        polygon = np.array(corners, dtype=np.float32).reshape(1, 4, 2).astype(np.int32)
+        cv2.fillPoly(mask, polygon, 255)
+        if len(limited.shape) == 2:
+            return cv2.bitwise_and(limited, limited, mask=mask)
+        return cv2.bitwise_and(limited, limited, mask=mask)
 
     def _current_camera_ocr_frame(self):  # type: ignore[no-untyped-def]
         displayed_frame = getattr(self, "_last_displayed_camera_frame_for_ocr", None)
@@ -4275,6 +4515,7 @@ class ScrabblePlotterApp:
         calibration.board_size = BOARD_SIZE
         calibration.cell_size_mm = float(self.cell_size_var.get())
         calibration.camera_index = int(self.camera_index_var.get())
+        calibration.tile_rack_camera_index = int(self.tile_rack_camera_index_var.get())
         calibration.offset_x_mm = float(self.offset_x_var.get())
         calibration.offset_y_mm = float(self.offset_y_var.get())
         calibration.x_steps_per_mm = float(self.x_steps_per_mm_var.get())
@@ -4292,6 +4533,9 @@ class ScrabblePlotterApp:
         calibration.actuator_countdown_seconds = int(float(self.actuator_countdown_seconds_var.get()))
         if calibration.actuator_countdown_seconds <= 0:
             raise ValueError("Actuator countdown seconds must be greater than 0.")
+        calibration.tile_cart_url = self.tile_cart_url_var.get().strip() or "http://192.168.4.1"
+        calibration.tile_cart_player_1_command = self.tile_cart_player_1_command_var.get().strip() or "backward"
+        calibration.tile_cart_player_2_command = self.tile_cart_player_2_command_var.get().strip() or "forward"
         calibration.premium_layout = self._premium_layout_from_form()
         return calibration
 
@@ -4524,6 +4768,7 @@ class ScrabblePlotterApp:
                 return
 
             confidence_threshold = self._ocr_confidence_threshold()
+            calibration = self._calibration_from_form()
 
             def start_scan(frame, source: str) -> None:  # type: ignore[no-untyped-def]
                 self._camera_word_scan_running = True
@@ -4534,7 +4779,7 @@ class ScrabblePlotterApp:
                 self._log(f"Challenge camera scan started from {source}.")
                 thread = threading.Thread(
                     target=self._camera_word_scan_worker,
-                    args=(frame.copy(), confidence_threshold, False, scan_token),
+                    args=(frame.copy(), confidence_threshold, False, scan_token, calibration),
                     daemon=True,
                 )
                 thread.start()
@@ -4579,6 +4824,7 @@ class ScrabblePlotterApp:
                 return
 
             confidence_threshold = self._ocr_confidence_threshold()
+            calibration = self._calibration_from_form()
             self._camera_word_scan_running = True
             self._pending_actuator_challenge_after_word_scan = True
             scan_token = self._next_camera_word_scan_token()
@@ -4587,7 +4833,7 @@ class ScrabblePlotterApp:
             self._log(f"Challenge camera scan started from {source}.")
             thread = threading.Thread(
                 target=self._camera_word_scan_worker,
-                args=(frame.copy(), confidence_threshold, False, scan_token),
+                args=(frame.copy(), confidence_threshold, False, scan_token, calibration),
                 daemon=True,
             )
             thread.start()
@@ -4906,6 +5152,7 @@ class ScrabblePlotterApp:
 
     def _on_close(self) -> None:
         self.stop_camera(clear_preview=False)
+        self.stop_tile_rack_camera()
         try:
             self._send_shutdown_board_down()
         finally:
@@ -5141,6 +5388,7 @@ class ScrabblePlotterApp:
 
     def _start_game(self) -> None:
         self._current_player = 1
+        self._tile_cart_player_position = None
         self._ai_player_running = False
         self._pending_ai_move_candidate = None
         if getattr(self, "_ai_turn_after_id", None):
@@ -5168,6 +5416,7 @@ class ScrabblePlotterApp:
     def _start_turn(self) -> None:
         self._current_player_display_var.set(f"Current Player: {self._current_player}")
         self._turn_start_board_state = dict(self._previous_board_state)
+        self._move_tile_cart_for_current_player()
         import time
         self._turn_end_time = time.time() + 120.0
         if not self._timer_running:
@@ -5214,6 +5463,79 @@ class ScrabblePlotterApp:
             return value.strip().lower() not in {"", "0", "false", "no", "off"}
         return bool(value)
 
+    def move_tile_cart_to_current_player(self) -> None:
+        self._move_tile_cart_for_current_player(force=True)
+
+    def _move_tile_cart_for_current_player(self, force: bool = False) -> None:
+        if not self._tile_cart_enabled():
+            return
+        player_id = self._current_player_id()
+        if not force and self._tile_cart_player_position == player_id:
+            return
+        if getattr(self, "_tile_cart_move_running", False):
+            self._log("Tile cart move skipped because another cart move is running.")
+            return
+
+        command = self._tile_cart_command_for_player(player_id)
+        self.send_tile_cart_command(command, player_id=player_id)
+
+    def send_tile_cart_command(self, command: str, player_id: int | None = None) -> None:
+        try:
+            command = self._normalize_tile_cart_command(command)
+            url = self._tile_cart_url_for_command(command)
+        except Exception as exc:
+            self._show_error(exc)
+            return
+
+        self._tile_cart_move_running = True
+
+        def work() -> str:
+            with urllib.request.urlopen(url, timeout=5.0) as response:
+                return response.read().decode("utf-8", errors="replace").strip()
+
+        def done(message: str) -> None:
+            self._tile_cart_move_running = False
+            if player_id in (1, 2):
+                self._tile_cart_player_position = player_id
+                self._set_status(f"Tile cart moved for Player {player_id}.")
+            else:
+                self._set_status(f"Tile cart command sent: {command}.")
+            self._log(f"Tile cart {command}: {message or 'ok'}")
+
+        def on_error(exc: Exception) -> None:
+            self._tile_cart_move_running = False
+            self._show_error(exc)
+
+        self._run_background_task(f"Moving tile cart ({command})...", work, done, on_error)
+
+    def _tile_cart_enabled(self) -> bool:
+        value = getattr(self, "tile_cart_enabled_var", None)
+        try:
+            return bool(value.get()) if value is not None else False
+        except Exception:
+            return bool(value)
+
+    def _tile_cart_command_for_player(self, player_id: int) -> str:
+        if player_id == 1:
+            return self.tile_cart_player_1_command_var.get()
+        if player_id == 2:
+            return self.tile_cart_player_2_command_var.get()
+        raise ValueError("Tile cart only supports Player 1 or Player 2.")
+
+    def _normalize_tile_cart_command(self, command: str) -> str:
+        normalized = str(command).strip().strip("/").lower()
+        if normalized not in {"forward", "backward", "stop"}:
+            raise ValueError("Tile cart command must be forward, backward, or stop.")
+        return normalized
+
+    def _tile_cart_url_for_command(self, command: str) -> str:
+        base_url = self.tile_cart_url_var.get().strip()
+        if not base_url:
+            raise ValueError("Enter the tile cart ESP32 URL.")
+        if not base_url.startswith(("http://", "https://")):
+            base_url = "http://" + base_url
+        return base_url.rstrip("/") + "/" + urllib.parse.quote(self._normalize_tile_cart_command(command))
+
     def run_ai_player_turn(self) -> None:
         try:
             if self._current_player_id() != 1:
@@ -5242,18 +5564,19 @@ class ScrabblePlotterApp:
                 return
 
             self._ai_player_running = True
-            self._set_status(f"Player 1 AI found {len(candidates)} legal move candidate(s). Asking Gemini...")
-            self._log(f"Player 1 AI candidate count sent to Gemini: {len(candidates)}")
+            self._set_status(f"Player 1 AI found {len(candidates)} legal move candidate(s). Asking OpenAI...")
+            self._log(f"Player 1 AI candidate count sent to OpenAI: {len(candidates)}")
 
             def work() -> AiMoveChoice:
-                agent = GeminiPlotterAgent(
-                    api_key=self.gemini_api_key_var.get(),
-                    model=self.gemini_model_var.get(),
+                agent = OpenAIPlotterAgent(
+                    endpoint=self.openai_endpoint_var.get(),
+                    api_key=self.openai_api_key_var.get(),
+                    model=self.openai_model_var.get(),
                 )
                 return agent.choose_ai_move(
                     candidates,
                     rack_letters,
-                    objective=self.gemini_objective_var.get(),
+                    objective=self.openai_objective_var.get(),
                     timeout=max(10.0, float(self.timeout_var.get()) * 10.0),
                 )
 
@@ -5265,7 +5588,7 @@ class ScrabblePlotterApp:
                 self._pending_ai_move_candidate = None
                 self._show_error(exc)
 
-            self._run_background_task("Asking Gemini to choose Player 1's move...", work, done, on_error)
+            self._run_background_task("Asking OpenAI to choose Player 1's move...", work, done, on_error)
         except Exception as exc:
             self._ai_player_running = False
             self._pending_ai_move_candidate = None
@@ -5294,7 +5617,7 @@ class ScrabblePlotterApp:
 
     def _handle_ai_move_choice(self, choice: AiMoveChoice) -> None:
         if choice.action == "pass":
-            reason = choice.reason or "Gemini passed."
+            reason = choice.reason or "OpenAI passed."
             self._log(f"Player 1 AI pass: {reason}")
             self._finish_ai_turn_without_move(reason)
             return
@@ -5302,7 +5625,7 @@ class ScrabblePlotterApp:
         candidate = choice.candidate
         if candidate is None:
             self._ai_player_running = False
-            self._show_error(RuntimeError("Gemini did not choose a playable candidate."))
+            self._show_error(RuntimeError("OpenAI did not choose a playable candidate."))
             return
         if choice.reason:
             self._log(f"Player 1 AI reason: {choice.reason}")
@@ -5626,7 +5949,12 @@ def raise_user_error(message: str) -> None:
 
 
 def launch_gui() -> None:
-    root = tb.Window(themename="flatly")
+    try:
+        import ttkbootstrap as tb
+
+        root = tb.Window(themename="flatly")
+    except ImportError:
+        root = tk.Tk()
     app = ScrabblePlotterApp(root)
     app._log("Ready.")
     root.mainloop()

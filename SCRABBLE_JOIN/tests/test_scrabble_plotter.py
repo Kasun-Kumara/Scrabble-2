@@ -22,12 +22,13 @@ from scrabble_plotter.calibration import (
     resolve_stored_path,
 )
 from scrabble_plotter.camera import open_camera_capture, read_camera_frame
-from scrabble_plotter.gemini_agent import (
-    GeminiDetectedWord,
-    GeminiPlotterAgent,
+from scrabble_plotter.openai_agent import (
+    OpenAIDetectedWord,
+    OpenAIPlotterAgent,
     PlotterAgentAction,
     _parse_json_object,
     format_detected_words_numbered,
+    normalize_openai_endpoint,
     parse_detected_words,
 )
 from scrabble_plotter.gui import (
@@ -141,11 +142,15 @@ class PlotterCalibrationTests(unittest.TestCase):
     def test_persistence_round_trip(self) -> None:
         calibration = PlotterCalibration(
             camera_index=2,
+            tile_rack_camera_index=3,
             offset_x_mm=12.5,
             offset_y_mm=24.5,
             cell_size_mm=25.0,
             cart_x_mm=111.0,
             cart_y_mm=222.0,
+            tile_cart_url="192.168.4.1",
+            tile_cart_player_1_command="backward",
+            tile_cart_player_2_command="forward",
             image_corners=[[0.0, 0.0], [360.0, 0.0], [360.0, 360.0], [0.0, 360.0]],
         )
 
@@ -155,6 +160,7 @@ class PlotterCalibrationTests(unittest.TestCase):
         self.assertEqual(loaded.board_size, BOARD_SIZE)
         self.assertEqual(loaded.cell_size_mm, 25.0)
         self.assertEqual(loaded.camera_index, 2)
+        self.assertEqual(loaded.tile_rack_camera_index, 3)
         self.assertEqual(loaded.offset_x_mm, 12.5)
         self.assertEqual(loaded.offset_y_mm, 24.5)
         self.assertEqual(loaded.machine_label_orientation, "A1-top-left")
@@ -162,6 +168,9 @@ class PlotterCalibrationTests(unittest.TestCase):
         self.assertEqual(loaded.y_steps_per_mm, 80.0)
         self.assertEqual(loaded.cart_x_mm, 111.0)
         self.assertEqual(loaded.cart_y_mm, 222.0)
+        self.assertEqual(loaded.tile_cart_url, "192.168.4.1")
+        self.assertEqual(loaded.tile_cart_player_1_command, "backward")
+        self.assertEqual(loaded.tile_cart_player_2_command, "forward")
         self.assertEqual(len(loaded.image_corners), 4)
 
     def test_persistence_round_trip_includes_step_settings(self) -> None:
@@ -396,6 +405,20 @@ class AiPlayerTests(unittest.TestCase):
 
 
 class CameraTests(unittest.TestCase):
+    def test_word_detection_board_mask_keeps_only_calibrated_area(self) -> None:
+        import numpy as np
+
+        app = object.__new__(ScrabblePlotterApp)
+        app._calibration = PlotterCalibration(
+            image_corners=[[20.0, 20.0], [80.0, 20.0], [80.0, 80.0], [20.0, 80.0]]
+        )
+        frame = np.full((100, 100, 3), 200, dtype=np.uint8)
+
+        masked = ScrabblePlotterApp._frame_limited_to_calibrated_board(app, frame)
+
+        self.assertEqual(masked[50, 50].tolist(), [200, 200, 200])
+        self.assertEqual(masked[10, 10].tolist(), [0, 0, 0])
+
     def test_read_camera_frame_retries_until_usable_frame(self) -> None:
         frame = _FakeFrame()
         camera = _FakeCapture(
@@ -924,7 +947,7 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(square_label(11, 11), "L12")
 
 
-class GeminiAgentTests(unittest.TestCase):
+class OpenAIAgentTests(unittest.TestCase):
     def _candidate(self, candidate_id: str = "C001") -> AiMoveCandidate:
         return AiMoveCandidate(
             candidate_id=candidate_id,
@@ -983,8 +1006,8 @@ class GeminiAgentTests(unittest.TestCase):
     def test_format_detected_words_as_numbered_list(self) -> None:
         text = format_detected_words_numbered(
             [
-                GeminiDetectedWord("CAT", "horizontal_left_to_right", 92.0),
-                GeminiDetectedWord("DOG", "vertical_top_to_bottom", 88.0),
+                OpenAIDetectedWord("CAT", "horizontal_left_to_right", 92.0),
+                OpenAIDetectedWord("DOG", "vertical_top_to_bottom", 88.0),
             ]
         )
 
@@ -998,10 +1021,10 @@ class GeminiAgentTests(unittest.TestCase):
         )
 
     def test_choose_ai_move_accepts_valid_candidate_id(self) -> None:
-        class Agent(GeminiPlotterAgent):
+        class Agent(OpenAIPlotterAgent):
             def _post(self, payload, timeout):  # type: ignore[no-untyped-def]
                 self.payload = payload
-                return {"candidates": [{"content": {"parts": [{"text": '{"action":"play","candidate_id":"C001","reason":"best"}'}]}}]}
+                return {"choices": [{"message": {"content": '{"action":"play","candidate_id":"C001","reason":"best"}'}}]}
 
         agent = Agent("key")
         candidate = self._candidate("C001")
@@ -1013,9 +1036,9 @@ class GeminiAgentTests(unittest.TestCase):
         self.assertEqual(choice.reason, "best")
 
     def test_choose_ai_move_accepts_pass(self) -> None:
-        class Agent(GeminiPlotterAgent):
+        class Agent(OpenAIPlotterAgent):
             def _post(self, payload, timeout):  # type: ignore[no-untyped-def]
-                return {"candidates": [{"content": {"parts": [{"text": '{"action":"pass","reason":"no good move"}'}]}}]}
+                return {"choices": [{"message": {"content": '{"action":"pass","reason":"no good move"}'}}]}
 
         choice = Agent("key").choose_ai_move([self._candidate()], ["C", "A", "T"])
 
@@ -1024,24 +1047,30 @@ class GeminiAgentTests(unittest.TestCase):
         self.assertEqual(choice.reason, "no good move")
 
     def test_choose_ai_move_rejects_unknown_candidate_id(self) -> None:
-        class Agent(GeminiPlotterAgent):
+        class Agent(OpenAIPlotterAgent):
             def _post(self, payload, timeout):  # type: ignore[no-untyped-def]
-                return {"candidates": [{"content": {"parts": [{"text": '{"action":"play","candidate_id":"C999","reason":"bad"}'}]}}]}
+                return {"choices": [{"message": {"content": '{"action":"play","candidate_id":"C999","reason":"bad"}'}}]}
 
         with self.assertRaisesRegex(ValueError, "unknown candidate"):
             Agent("key").choose_ai_move([self._candidate()], ["C", "A", "T"])
 
     def test_choose_ai_move_rejects_malformed_json(self) -> None:
-        class Agent(GeminiPlotterAgent):
+        class Agent(OpenAIPlotterAgent):
             def _post(self, payload, timeout):  # type: ignore[no-untyped-def]
-                return {"candidates": [{"content": {"parts": [{"text": "not json"}]}}]}
+                return {"choices": [{"message": {"content": "not json"}}]}
 
         with self.assertRaises(json.JSONDecodeError):
             Agent("key").choose_ai_move([self._candidate()], ["C", "A", "T"])
 
     def test_choose_ai_move_requires_api_key(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Gemini API key"):
-            GeminiPlotterAgent("")
+        with self.assertRaisesRegex(ValueError, "OpenAI API key"):
+            OpenAIPlotterAgent("")
+
+    def test_endpoint_normalization_accepts_base_v1_url(self) -> None:
+        self.assertEqual(
+            normalize_openai_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions",
+        )
 
 
 class CliTests(unittest.TestCase):
@@ -1360,6 +1389,21 @@ class SerialSenderTests(unittest.TestCase):
 
 
 class GameStateTests(unittest.TestCase):
+    def test_tile_cart_url_for_command_adds_http_and_route(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_cart_url_var = _FakeVar("192.168.4.1")
+
+        url = ScrabblePlotterApp._tile_cart_url_for_command(app, "forward")
+
+        self.assertEqual(url, "http://192.168.4.1/forward")
+
+    def test_tile_cart_rejects_unknown_command(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_cart_url_var = _FakeVar("http://192.168.4.1")
+
+        with self.assertRaisesRegex(ValueError, "forward, backward, or stop"):
+            ScrabblePlotterApp._tile_cart_url_for_command(app, "left")
+
     def _game_app(self):
         app = object.__new__(ScrabblePlotterApp)
         app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]

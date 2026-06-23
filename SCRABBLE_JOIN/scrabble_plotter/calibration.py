@@ -52,6 +52,7 @@ class PlotterCalibration:
     image_path: str | None = None
     image_corners: list[list[float]] = field(default_factory=list)
     camera_index: int = 0
+    tile_rack_camera_index: int = 1
     offset_x_mm: float = 0.0
     offset_y_mm: float = 0.0
     cell_size_mm: float = CELL_SIZE_MM
@@ -70,6 +71,9 @@ class PlotterCalibration:
     actuator_baud: int = DEFAULT_ACTUATOR_BAUD
     actuator_timeout: float = DEFAULT_ACTUATOR_TIMEOUT
     actuator_countdown_seconds: int = DEFAULT_ACTUATOR_COUNTDOWN_SECONDS
+    tile_cart_url: str = "http://192.168.4.1"
+    tile_cart_player_1_command: str = "backward"
+    tile_cart_player_2_command: str = "forward"
 
     def set_image_corners(
         self,
@@ -149,6 +153,7 @@ class PlotterCalibration:
             "image_path": self.image_path,
             "image_corners": self.image_corners,
             "camera_index": self.camera_index,
+            "tile_rack_camera_index": self.tile_rack_camera_index,
             "offset_x_mm": self.offset_x_mm,
             "offset_y_mm": self.offset_y_mm,
             "cell_size_mm": self.cell_size_mm,
@@ -166,6 +171,9 @@ class PlotterCalibration:
             "actuator_baud": self.actuator_baud,
             "actuator_timeout": self.actuator_timeout,
             "actuator_countdown_seconds": self.actuator_countdown_seconds,
+            "tile_cart_url": self.tile_cart_url,
+            "tile_cart_player_1_command": self.tile_cart_player_1_command,
+            "tile_cart_player_2_command": self.tile_cart_player_2_command,
         }
 
     @classmethod
@@ -180,6 +188,7 @@ class PlotterCalibration:
             image_path=payload.get("image_path"),
             image_corners=payload.get("image_corners", []),
             camera_index=int(payload.get("camera_index", 0)),
+            tile_rack_camera_index=int(payload.get("tile_rack_camera_index", 1)),
             offset_x_mm=float(payload.get("offset_x_mm", 0.0)),
             offset_y_mm=float(payload.get("offset_y_mm", 0.0)),
             cell_size_mm=float(payload.get("cell_size_mm", CELL_SIZE_MM)),
@@ -204,6 +213,9 @@ class PlotterCalibration:
             actuator_countdown_seconds=int(
                 payload.get("actuator_countdown_seconds", DEFAULT_ACTUATOR_COUNTDOWN_SECONDS)
             ),
+            tile_cart_url=str(payload.get("tile_cart_url") or "http://192.168.4.1"),
+            tile_cart_player_1_command=str(payload.get("tile_cart_player_1_command") or "backward"),
+            tile_cart_player_2_command=str(payload.get("tile_cart_player_2_command") or "forward"),
         )
 
     @classmethod

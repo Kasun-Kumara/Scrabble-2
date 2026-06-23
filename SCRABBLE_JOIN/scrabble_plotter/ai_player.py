@@ -101,17 +101,17 @@ class AiMoveChoice:
     def validate(self, candidates: Iterable[AiMoveCandidate]) -> "AiMoveChoice":
         action = self.action.strip().lower()
         if action not in {"play", "pass"}:
-            raise ValueError(f"Gemini returned unsupported AI action: {self.action}")
+            raise ValueError(f"OpenAI returned unsupported AI action: {self.action}")
         if action == "pass":
             return replace(self, action="pass", candidate_id=None, candidate=None)
 
         candidate_id = (self.candidate_id or "").strip().upper()
         if not candidate_id:
-            raise ValueError("Gemini chose play without a candidate id.")
+            raise ValueError("OpenAI chose play without a candidate id.")
         candidates_by_id = {candidate.candidate_id.upper(): candidate for candidate in candidates}
         candidate = candidates_by_id.get(candidate_id)
         if candidate is None:
-            raise ValueError(f"Gemini chose unknown candidate id: {candidate_id}")
+            raise ValueError(f"OpenAI chose unknown candidate id: {candidate_id}")
         return replace(self, action="play", candidate_id=candidate.candidate_id, candidate=candidate)
 
     @classmethod
