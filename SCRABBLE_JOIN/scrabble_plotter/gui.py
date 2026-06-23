@@ -2940,10 +2940,17 @@ class ScrabblePlotterApp:
             self._show_error(exc)
 
     def _validate_pick_drop_targets(self, pickup_target: str, drop_target: str) -> None:
-        if not (self._is_tile_rack_target(pickup_target) or self._looks_like_board_square(pickup_target)):
-            raise ValueError("Enter pickup as a board square like A1 or rack slot TR1 to TR7.")
-        if not self._looks_like_board_square(drop_target):
-            raise ValueError("Enter drop as a board square like H8.")
+        def is_valid_target(target: str) -> bool:
+            return (
+                self._is_tile_rack_target(target) or
+                self._is_tile_cart_target(target) or
+                self._looks_like_board_square(target)
+            )
+
+        if not is_valid_target(pickup_target):
+            raise ValueError("Enter pickup as a board square (e.g. A1), rack slot (TR1-TR7), or cart slot (TC1-TC16).")
+        if not is_valid_target(drop_target):
+            raise ValueError("Enter drop as a board square (e.g. H8), rack slot (TR1-TR7), or cart slot (TC1-TC16).")
 
     def _pick_drop_z_height_command(self) -> str:
         angle = int(float(self.z_height_angle.get()))
