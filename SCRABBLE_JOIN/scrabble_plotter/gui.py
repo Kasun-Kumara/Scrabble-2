@@ -986,12 +986,23 @@ class ScrabblePlotterApp:
 
     def preview_move(self) -> None:
         try:
+            target = self.square_var.get().strip().upper()
+            if self._is_tile_rack_target(target):
+                command, x, y = self._tile_rack_target_move_command(target)
+                self._set_status(f"Preview {target} -> X={x:.3f}, Y={y:.3f}")
+                self._log(command)
+                return
+            if self._is_tile_cart_target(target):
+                command, x, y = self._tile_cart_target_move_command(target)
+                self._set_status(f"Preview {target} -> X={x:.3f}, Y={y:.3f}")
+                self._log(command)
+                return
             calibration = self._calibration_from_form()
             calibration.validate_ready_for_move()
-            square = parse_square_label(self.square_var.get())
+            square = parse_square_label(target)
             x, y = calibration.square_center_in_machine(square)
             gcode = format_move_command(x, y, self._optional_float(self.feed_rate_var.get()), self.command_var.get())
-            self._set_status(f"{square.label} -> X={x:.3f}, Y={y:.3f}")
+            self._set_status(f"Preview {square.label} -> X={x:.3f}, Y={y:.3f}")
             self._log(gcode)
         except Exception as exc:
             self._show_error(exc)
@@ -1011,6 +1022,19 @@ class ScrabblePlotterApp:
                     self._log(command)
 
                 self._run_background_task(f"Moving to {target}...", work, done)
+                return
+            if self._is_tile_cart_target(target):
+                command, x, y = self._tile_cart_target_move_command(target)
+                config = self._serial_config()
+
+                def work_tc():  # type: ignore[no-untyped-def]
+                    return self._send_tile_rack_move_command(command, config=config)
+
+                def done_tc(_responses) -> None:  # type: ignore[no-untyped-def]
+                    self._set_status(f"Moved to {target} at X{x:g} Y{y:g}.")
+                    self._log(command)
+
+                self._run_background_task(f"Moving to {target}...", work_tc, done_tc)
                 return
             calibration = self._calibration_from_form()
             calibration.validate_ready_for_move()
