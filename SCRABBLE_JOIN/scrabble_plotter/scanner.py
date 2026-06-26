@@ -718,12 +718,13 @@ def read_frame_with_easyocr(frame):  # type: ignore[no-untyped-def]
         try:
             return reader.readtext(
                 frame,
-                allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789|!",
+                allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ",
                 batch_size=4,
                 paragraph=False,
-                text_threshold=0.45,
-                low_text=0.25,
-                link_threshold=0.25,
+                text_threshold=0.3,
+                low_text=0.2,
+                decoder="beamsearch",
+                beamWidth=5,
             )
         except TypeError:
             return reader.readtext(frame)
@@ -1131,6 +1132,10 @@ def cell_looks_occupied(cell_image) -> bool:  # type: ignore[no-untyped-def]
     gray = _cell_gray_inner(cell_image, margin_ratio=0.18)
     if gray.size == 0:
         return False
+        
+    # Stretch contrast within the cell to handle glare without distorting letters
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(blurred, 60, 180)
     edge_density = float((edges > 0).sum()) / float(edges.size)
@@ -1175,6 +1180,9 @@ def preprocess_cell_for_ocr(cell_image):  # type: ignore[no-untyped-def]
     cv2 = _require_cv2()
     gray = _cell_gray_inner(cell_image, margin_ratio=0.12)
     gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     return cv2.adaptiveThreshold(
         gray,
@@ -1182,7 +1190,7 @@ def preprocess_cell_for_ocr(cell_image):  # type: ignore[no-untyped-def]
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
         31,
-        8,
+        5,
     )
 
 
@@ -1797,7 +1805,7 @@ def _easy_ocr_reader():
     global _EASY_OCR_READER
     if _EASY_OCR_READER is None:
         easyocr = _require_easyocr()
-        _EASY_OCR_READER = easyocr.Reader(["en"], gpu=False)
+        _EASY_OCR_READER = easyocr.Reader(["en"], gpu=True)
     return _EASY_OCR_READER
 
 

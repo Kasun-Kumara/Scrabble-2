@@ -87,7 +87,7 @@ class GCodeSender:
             return
 
         serial = _require_serial()
-        connection = serial.Serial(self.config.port, self.config.baud, timeout=self.config.timeout, write_timeout=self.config.timeout)
+        connection = serial.Serial(self.config.port, self.config.baud, timeout=self.config.timeout)
         try:
             connection.setDTR(False)
             connection.setRTS(False)
@@ -190,3 +190,13 @@ class BoardActuatorSender(GCodeSender):
     def set_led_cells(self, labels: list[str]) -> list[str]:
         payload = ",".join(label.strip().upper() for label in labels if label.strip())
         return self.send_command(f"LED_CELLS {payload}")
+
+    def set_scores(self, player_1_score: int, player_2_score: int) -> list[str]:
+        return self.send_command(f"SCORE P1 {int(player_1_score)} P2 {int(player_2_score)}")
+
+    def take_challenge_choice(self) -> list[str]:
+        return self.send_command("CHALLENGE_TAKE")
+
+    def set_led_color(self, red: int, green: int, blue: int, labels: list[str]) -> list[str]:
+        payload = ",".join(label.strip().upper() for label in labels if label.strip())
+        return self.send_command(f"LED_COLOR {int(red)} {int(green)} {int(blue)} {payload}")

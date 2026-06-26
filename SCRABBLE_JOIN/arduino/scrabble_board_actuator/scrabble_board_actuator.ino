@@ -139,6 +139,11 @@ const byte MAX_RUNTIME_WORDS = 10;
 const byte MAX_WORD_LENGTH = 16;
 char runtimeWords[MAX_RUNTIME_WORDS][MAX_WORD_LENGTH + 1];
 byte runtimeWordCount = 0;
+int player1Score = 0;
+int player2Score = 0;
+bool challengeChoicePending = false;
+int chosenWordIndex = -1;
+char chosenWord[MAX_WORD_LENGTH + 1];
 
 // ================= STATES =================
 bool displayOn = false;
@@ -261,6 +266,68 @@ bool showLedCells(char* payload, int* litCount, bool clearFirst, bool showAfter)
   return true;
 }
 
+bool showLedColorCells(char* payload, int* litCount, bool clearFirst, bool showAfter) {
+  char* redText = strtok(payload, " \t");
+  char* greenText = strtok(NULL, " \t");
+  char* blueText = strtok(NULL, " \t");
+  char* cellsText = strtok(NULL, "");
+  if (redText == NULL || greenText == NULL || blueText == NULL || cellsText == NULL) {
+    return false;
+  }
+
+  long red = atol(redText);
+  long green = atol(greenText);
+  long blue = atol(blueText);
+  if (red < 0 || red > 255 || green < 0 || green > 255 || blue < 0 || blue > 255) {
+    return false;
+  }
+
+  if (clearFirst) {
+    strip.clear();
+    *litCount = 0;
+  }
+
+  char* tokenStart = cellsText;
+  for (char* cursor = cellsText; ; cursor++) {
+    bool atEnd = *cursor == '\0';
+    bool separator = *cursor == ',' || *cursor == ';' || *cursor == ' ' || *cursor == '\t';
+
+    if (atEnd || separator) {
+      char saved = *cursor;
+      *cursor = '\0';
+
+      if (tokenStart[0] != '\0') {
+        byte row = 0;
+        byte col = 0;
+        if (!parseLedCellToken(tokenStart, &row, &col)) {
+          if (clearFirst) {
+            strip.clear();
+            strip.show();
+          }
+          return false;
+        }
+
+        int pixel = ledPixelIndex(row, col);
+        if (pixel >= 0 && pixel < LED_COUNT) {
+          strip.setPixelColor(pixel, strip.Color((byte)red, (byte)green, (byte)blue));
+          (*litCount)++;
+        }
+      }
+
+      if (atEnd) {
+        break;
+      }
+      *cursor = saved;
+      tokenStart = cursor + 1;
+    }
+  }
+
+  if (showAfter) {
+    strip.show();
+  }
+  return true;
+}
+
 bool copyCleanWord(char* destination, const char* word) {
   byte outputIndex = 0;
   for (byte inputIndex = 0; word[inputIndex] != '\0' && outputIndex < MAX_WORD_LENGTH; inputIndex++) {
@@ -276,6 +343,9 @@ bool copyCleanWord(char* destination, const char* word) {
 void clearRuntimeWords() {
   runtimeWordCount = 0;
   currentWordIndex = 0;
+  challengeChoicePending = false;
+  chosenWordIndex = -1;
+  chosenWord[0] = '\0';
   for (byte index = 0; index < MAX_RUNTIME_WORDS; index++) {
     runtimeWords[index][0] = '\0';
   }
@@ -424,6 +494,12 @@ void chooseCurrentWord() {
   inChallengeMode = true;
   showCountdown = false;
   wordChosenTime = millis();
+  if (activeWordCount() > 0) {
+    chosenWordIndex = currentWordIndex;
+    strncpy(chosenWord, currentWord(), MAX_WORD_LENGTH);
+    chosenWord[MAX_WORD_LENGTH] = '\0';
+    challengeChoicePending = true;
+  }
 }
 
 void displayOff() {
@@ -526,7 +602,37 @@ void printStatus() {
   Serial.print(F(" word_count="));
   Serial.print(activeWordCount());
   Serial.print(F(" word="));
-  Serial.println(currentWord());
+  Serial.print(currentWord());
+  Serial.print(F(" p1="));
+  Serial.print(player1Score);
+  Serial.print(F(" p2="));
+  Serial.println(player2Score);
+}
+
+bool parseScoreCommand(char* text) {
+  int p1 = player1Score;
+  int p2 = player2Score;
+  char* token = strtok(text, " \t");
+  while (token != NULL) {
+    if (strcmp(token, "P1") == 0) {
+      char* value = strtok(NULL, " \t");
+      if (value == NULL) {
+        return false;
+      }
+      p1 = atoi(value);
+    } else if (strcmp(token, "P2") == 0) {
+      char* value = strtok(NULL, " \t");
+      if (value == NULL) {
+        return false;
+      }
+      p2 = atoi(value);
+    }
+    token = strtok(NULL, " \t");
+  }
+  player1Score = max(0, p1);
+  player2Score = max(0, p2);
+  displayOn = true;
+  return true;
 }
 
 void handleSerialCommand(char* rawCommand) {
@@ -571,6 +677,16 @@ void handleSerialCommand(char* rawCommand) {
   } else if (strcmp(cmd, "CHALLENGE_CANCEL") == 0) {
     cancelChallengeMode();
     Serial.println(F("ok challenge cancel"));
+  } else if (strcmp(cmd, "CHALLENGE_TAKE") == 0) {
+    if (challengeChoicePending && chosenWord[0] != '\0') {
+      Serial.print(F("ok challenge chosen "));
+      Serial.print(chosenWordIndex);
+      Serial.print(F(" "));
+      Serial.println(chosenWord);
+      challengeChoicePending = false;
+    } else {
+      Serial.println(F("ok challenge none"));
+    }
   } else if (strcmp(cmd, "WORD_CLEAR") == 0) {
     clearRuntimeWords();
     clearLEDs();
@@ -639,9 +755,37 @@ void handleSerialCommand(char* rawCommand) {
     }
     Serial.print(F("ok led append "));
     Serial.println(litCount);
+  } else if (commandStartsWith(cmd, "LED_COLOR")) {
+    char* payload = trimWhitespace(cmd + strlen("LED_COLOR"));
+    int litCount = 0;
+    if (!showLedColorCells(payload, &litCount, true, true)) {
+      Serial.println(F("err invalid led color"));
+      return;
+    }
+    Serial.print(F("ok led color "));
+    Serial.println(litCount);
+  } else if (commandStartsWith(cmd, "LED_COLOR_APPEND")) {
+    char* payload = trimWhitespace(cmd + strlen("LED_COLOR_APPEND"));
+    int litCount = 0;
+    if (!showLedColorCells(payload, &litCount, false, false)) {
+      Serial.println(F("err invalid led color append"));
+      return;
+    }
+    Serial.print(F("ok led color append "));
+    Serial.println(litCount);
   } else if (commandStartsWith(cmd, "LED_SHOW")) {
     strip.show();
     Serial.println(F("ok led show"));
+  } else if (commandStartsWith(cmd, "SCORE")) {
+    char* scoreText = trimWhitespace(cmd + strlen("SCORE"));
+    if (!parseScoreCommand(scoreText)) {
+      Serial.println(F("err invalid score"));
+      return;
+    }
+    Serial.print(F("ok score p1 "));
+    Serial.print(player1Score);
+    Serial.print(F(" p2 "));
+    Serial.println(player2Score);
   } else if (strcmp(cmd, "DISPLAY_ON") == 0) {
     displayOn = true;
     Serial.println(F("ok display on"));
@@ -709,6 +853,11 @@ void drawDisplayContent() {
     u8g2.print(remaining);
     u8g2.print(F("s"));
   } else if (wordChosen) {
+    u8g2.setCursor(0, 10);
+    u8g2.print(F("P1:"));
+    u8g2.print(player1Score);
+    u8g2.print(F("  P2:"));
+    u8g2.print(player2Score);
     u8g2.setCursor(0, 20);
     u8g2.print(F("Chosen Word:"));
     u8g2.setCursor(0, 40);
@@ -718,10 +867,15 @@ void drawDisplayContent() {
       u8g2.print(F("No camera words"));
     }
   } else if (inChallengeMode) {
-    u8g2.setCursor(0, 20);
+    u8g2.setCursor(0, 10);
+    u8g2.print(F("P1:"));
+    u8g2.print(player1Score);
+    u8g2.print(F("  P2:"));
+    u8g2.print(player2Score);
+    u8g2.setCursor(0, 24);
     u8g2.print(F("Challenge Mode"));
     if (activeWordCount() > 0) {
-      u8g2.setCursor(0, 40);
+      u8g2.setCursor(0, 42);
       u8g2.print(F("Choose word:"));
       u8g2.setCursor(0, 60);
       u8g2.print(currentWord());
@@ -732,7 +886,12 @@ void drawDisplayContent() {
       u8g2.print(F("then challenge"));
     }
   } else {
-    u8g2.setCursor(30, 32);
+    u8g2.setCursor(0, 20);
+    u8g2.print(F("P1:"));
+    u8g2.print(player1Score);
+    u8g2.print(F("  P2:"));
+    u8g2.print(player2Score);
+    u8g2.setCursor(30, 44);
     u8g2.print(F("SCRABLIFY"));
   }
 }

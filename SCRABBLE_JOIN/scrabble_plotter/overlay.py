@@ -76,6 +76,7 @@ def draw_board_overlay(
         board_size=calibration.board_size,
         board_letters=board_letters,
         show_empty_labels=True,
+        premium_layout=calibration.premium_layout,
     )
 
 
@@ -99,9 +100,20 @@ def draw_grid_overlay(
     board_size: int = BOARD_SIZE,
     board_letters: list[list[str]] | None = None,
     show_empty_labels: bool = True,
+    premium_layout: list[list[str]] | None = None,
 ):  # type: ignore[no-untyped-def]
     cv2 = _require_cv2()
     overlay = frame.copy()
+
+    from .calibration import PREMIUM_NORMAL
+    from .scoring import PREMIUM_SHORT_LABELS
+
+    PREMIUM_COLORS = {
+        "double_letter": (255, 200, 100),  # Light Blue
+        "triple_letter": (255, 50, 50),    # Dark Blue
+        "double_word": (100, 100, 255),    # Pink
+        "triple_word": (0, 0, 255),        # Red
+    }
 
     for start, end in grid_segments(corners, board_size):
         cv2.line(overlay, _int_point(start), _int_point(end), (0, 255, 255), 1, cv2.LINE_AA)
@@ -123,16 +135,31 @@ def draw_grid_overlay(
         if letter:
             _draw_centered_text(overlay, letter, (x, y), 0.95, (0, 0, 0), (70, 255, 130), 2)
         elif show_empty_labels:
-            cv2.putText(
-                overlay,
-                label,
-                (x - 10, y + 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+            premium = premium_layout[row][col] if premium_layout else PREMIUM_NORMAL
+            if premium != PREMIUM_NORMAL:
+                short_label = PREMIUM_SHORT_LABELS.get(premium, "")
+                color = PREMIUM_COLORS.get(premium, (255, 255, 255))
+                cv2.putText(
+                    overlay,
+                    short_label,
+                    (x - 12, y + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+            else:
+                cv2.putText(
+                    overlay,
+                    label,
+                    (x - 10, y + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
 
     return overlay
 

@@ -17,6 +17,8 @@ from scrabble_plotter.calibration import (
     MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT,
     PREMIUM_DOUBLE_LETTER,
     PREMIUM_DOUBLE_WORD,
+    PREMIUM_TRIPLE_LETTER,
+    PREMIUM_TRIPLE_WORD,
     PlotterCalibration,
     path_for_storage,
     resolve_stored_path,
@@ -32,6 +34,7 @@ from scrabble_plotter.openai_agent import (
     parse_detected_words,
 )
 from scrabble_plotter.gui import (
+    ChallengeCandidate,
     PICK_DROP_MAGNET_DELAY_MS,
     PICK_DROP_MOVE_DELAY_MS,
     PICK_DROP_Z_SETTLE_DELAY_MS,
@@ -61,6 +64,7 @@ from scrabble_plotter.scanner import (
     parse_easyocr_text_boxes,
     parse_paddleocr_text_boxes,
     parse_tesseract_data,
+    read_cell_with_tesseract,
     scan_board_image,
     scan_camera_letters,
     scan_camera_words,
@@ -328,6 +332,21 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(result.words[0].base_score, 21)
         self.assertEqual(result.words[0].score, 42)
 
+    def test_premiums_can_be_limited_to_newly_placed_squares(self) -> None:
+        board = [["" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        board[0][0] = "Q"
+        board[0][1] = "I"
+
+        premiums = [["normal" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        premiums[0][0] = PREMIUM_DOUBLE_LETTER
+        premiums[0][1] = PREMIUM_DOUBLE_WORD
+
+        result = score_board(board, premium_layout=premiums, premium_squares={"B1"})
+
+        self.assertEqual(result.words[0].word, "QI")
+        self.assertEqual(result.words[0].base_score, 11)
+        self.assertEqual(result.words[0].score, 22)
+
     def test_blank_tiles_score_zero(self) -> None:
         board = [["" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
         board[0][0] = "Z"
@@ -482,12 +501,26 @@ class CameraTests(unittest.TestCase):
         self.assertTrue(empty_capture.released)
 
 
+
 class ScannerTests(unittest.TestCase):
     def test_tesseract_parser_chooses_best_letter(self) -> None:
         letter, confidence = parse_tesseract_data({"text": ["", "B", "A"], "conf": ["-1", "42", "91"]})
 
         self.assertEqual(letter, "A")
         self.assertEqual(confidence, 91.0)
+
+    def test_cell_ocr_tries_multiple_preprocessed_views(self) -> None:
+        cv2 = _require_cv2_for_tests()
+        _require_tesseract_for_tests()
+
+        self.assertEqual(
+            read_cell_with_tesseract(_synthetic_letter_cell("T", cv2), "A1")[0],
+            "T",
+        )
+        self.assertEqual(
+            read_cell_with_tesseract(_synthetic_letter_cell("O", cv2), "B1")[0],
+            "O",
+        )
 
     def test_camera_letter_parser_filters_and_scales_captured_letters(self) -> None:
         letters = parse_camera_letter_data(
@@ -683,7 +716,7 @@ class ScannerTests(unittest.TestCase):
 
         self.assertEqual(len(words), 1000)
         self.assertEqual(len(bank), 1000)
-        for word in ("CAT", "DOG", "OIL", "WORD", "TREE"):
+        for word in ("CAT", "DOG", "OIL", "WOOD", "WORD", "TREE"):
             with self.subTest(word=word):
                 self.assertIn(word, bank)
         self.assertNotIn("ZZQ", bank)
@@ -1387,6 +1420,26 @@ class SerialSenderTests(unittest.TestCase):
         self.assertEqual(connection.writes, ["LED_CELLS A1,C10\n"])
         self.assertEqual(responses, ["ok led cells 2"])
 
+    def test_board_actuator_sender_formats_score_command(self) -> None:
+        connection = _FakeSerialConnection(["ok score p1 12 p2 8\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.set_scores(12, 8)
+
+        self.assertEqual(connection.writes, ["SCORE P1 12 P2 8\n"])
+        self.assertEqual(responses, ["ok score p1 12 p2 8"])
+
+    def test_board_actuator_sender_formats_led_color_command(self) -> None:
+        connection = _FakeSerialConnection(["ok led color 2\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.set_led_color(1, 2, 3, ["a1", "b2"])
+
+        self.assertEqual(connection.writes, ["LED_COLOR 1 2 3 A1,B2\n"])
+        self.assertEqual(responses, ["ok led color 2"])
+
 
 class GameStateTests(unittest.TestCase):
     def test_tile_cart_url_for_command_adds_http_and_route(self) -> None:
@@ -1855,7 +1908,7 @@ class BoardActuatorGuiTests(unittest.TestCase):
         ScrabblePlotterApp.start_actuator_challenge(app)
 
         labels = ScrabblePlotterApp._current_led_cell_labels(app)
-        self.assertEqual(app.commands, ["WORD_LIST CAT", "CHALLENGE_START", "LED_CELLS C10,D10"])
+        self.assertEqual(app.commands, ["WORD_LIST CD", "CHALLENGE_START", "LED_CELLS C10,D10", "LED_SHOW"])
         self.assertEqual(app.errors, [])
         self.assertEqual(app.statuses[-1], "Challenge started with 2 red LED cell(s).")
         self.assertEqual(labels, ["C10", "D10"])
@@ -1918,7 +1971,7 @@ class BoardActuatorGuiTests(unittest.TestCase):
         ScrabblePlotterApp._handle_camera_word_scan_result(app, scan, announce=False, scan_token=4)
 
         labels = ScrabblePlotterApp._current_led_cell_labels(app)
-        self.assertEqual(app.commands, ["WORD_LIST CAT", "CHALLENGE_START", "LED_CELLS C10,D10,E10"])
+        self.assertEqual(app.commands, ["WORD_LIST CAT", "CHALLENGE_START", "LED_CELLS C10,D10,E10", "LED_SHOW"])
         self.assertFalse(app._pending_actuator_challenge_after_word_scan)
         self.assertEqual(app.errors, [])
         self.assertEqual(labels, ["C10", "D10", "E10"])
@@ -1969,19 +2022,20 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         ScrabblePlotterApp._send_led_cells_to_actuator(app, ["A1", "C10"])
 
-        self.assertEqual(app.commands, ["LED_CELLS A1,C10"])
+        self.assertEqual(app.commands, ["LED_CELLS A1,C10", "LED_SHOW"])
         self.assertEqual(app.statuses[-1], "Sent letter lights to the board actuator (2 lit cell(s)).")
 
-    def test_send_led_cells_to_actuator_rejects_too_long_command(self) -> None:
+    def test_send_led_cells_to_actuator_chunks_large_cell_lists(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
         app.commands = []
         app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
         labels = [f"{chr(ord('A') + col)}{row}" for col in range(BOARD_SIZE) for row in range(1, BOARD_SIZE + 1)]
 
-        with self.assertRaises(ValueError):
-            ScrabblePlotterApp._send_led_cells_to_actuator(app, labels, announce=False)
+        ScrabblePlotterApp._send_led_cells_to_actuator(app, labels, announce=False)
 
-        self.assertEqual(app.commands, [])
+        self.assertEqual(app.commands[0].split()[0], "LED_CELLS")
+        self.assertTrue(all(command.startswith(("LED_CELLS", "LED_APPEND", "LED_SHOW")) for command in app.commands))
+        self.assertEqual(app.commands[-1], "LED_SHOW")
 
     def test_reveal_actuator_word_sends_word_choose_only(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
@@ -1994,6 +2048,71 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         self.assertEqual(app.commands, ["WORD_CHOOSE"])
         self.assertEqual(app.errors, [])
+
+    def test_challenge_choice_valid_word_awards_owner_and_lights_word(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._challenge_candidates = [ChallengeCandidate("CAT", ("A1", "B1", "C1"), 5, 1)]
+        app._current_player = 2
+        app._current_player_display_var = _FakeVar("Current Player: 2")
+        app._player_1_score = 0
+        app._player_2_score = 0
+        app._player_1_score_var = _FakeVar("")
+        app._player_2_score_var = _FakeVar("")
+        app.actuator_port_var = _FakeVar("COM9")
+        app.commands = []
+        app.logs = []
+        app.statuses = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._handle_challenge_choice(app, 0, "CAT")
+
+        self.assertEqual(app._player_1_score, 5)
+        self.assertEqual(app._player_2_score, 0)
+        self.assertEqual(app.commands, ["LED_COLOR 180 0 0 A1,B1,C1", "LED_SHOW", "SCORE P1 5 P2 0"])
+        self.assertIn("valid", app.statuses[-1])
+
+    def test_challenge_choice_invalid_word_awards_challenger(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._challenge_candidates = [ChallengeCandidate("ZZQ", ("A1", "B1", "C1"), 29, 1)]
+        app._current_player = 2
+        app._current_player_display_var = _FakeVar("Current Player: 2")
+        app._player_1_score = 0
+        app._player_2_score = 0
+        app._player_1_score_var = _FakeVar("")
+        app._player_2_score_var = _FakeVar("")
+        app.actuator_port_var = _FakeVar("COM9")
+        app.commands = []
+        app.logs = []
+        app.statuses = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._handle_challenge_choice(app, 0, "ZZQ")
+
+        self.assertEqual(app._player_1_score, 0)
+        self.assertEqual(app._player_2_score, 29)
+        self.assertEqual(app.commands[-1], "SCORE P1 0 P2 29")
+        self.assertIn("not valid", app.statuses[-1])
+
+    def test_premium_led_commands_group_square_colors(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        layout = [["normal" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        layout[0][0] = PREMIUM_DOUBLE_LETTER
+        layout[0][1] = PREMIUM_TRIPLE_LETTER
+        layout[0][2] = PREMIUM_DOUBLE_WORD
+        layout[0][3] = PREMIUM_TRIPLE_WORD
+        app._premium_layout_from_form = lambda: layout
+
+        commands = ScrabblePlotterApp._premium_led_commands(app)
+
+        self.assertIn("LED_COLOR 0 0 180 A1", commands)
+        self.assertIn("LED_COLOR_APPEND 0 160 0 B1", commands)
+        self.assertIn("LED_COLOR_APPEND 220 95 0 C1", commands)
+        self.assertIn("LED_COLOR_APPEND 130 0 180 D1", commands)
+        self.assertEqual(commands[-1], "LED_SHOW")
 
     def test_letter_capture_does_not_clear_tile_rack_side_from_board_grid(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
@@ -2272,6 +2391,33 @@ def _require_cv2_for_tests():
     except ImportError as exc:
         raise unittest.SkipTest("OpenCV is required for scanner tests.") from exc
     return cv2
+
+
+def _require_tesseract_for_tests():
+    try:
+        import pytesseract  # type: ignore
+
+        pytesseract.get_tesseract_version()
+    except Exception as exc:
+        raise unittest.SkipTest("Tesseract is required for cell OCR tests.") from exc
+
+
+def _synthetic_letter_cell(letter: str, cv2):
+    import numpy as np
+
+    cell_size = 80
+    image = np.full((cell_size, cell_size, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        image,
+        letter,
+        (20, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.7,
+        (20, 20, 20),
+        4,
+        cv2.LINE_AA,
+    )
+    return image
 
 
 if __name__ == "__main__":
