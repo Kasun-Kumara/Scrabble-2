@@ -389,13 +389,14 @@ def scan_camera_letters(
     frame,
     confidence_threshold: float = 50.0,
     ocr_reader: EasyOcrReader | None = None,
+    calibration_corners: list | None = None,
 ) -> CameraLetterScanResult:  # type: ignore[no-untyped-def]
     if ocr_reader is None:
         tiles = detect_camera_tiles(frame, confidence_threshold=min(confidence_threshold, 15.0))
         if tiles:
             return CameraLetterScanResult(
                 letters=captured_letters_from_camera_tiles(tiles),
-                grid=build_camera_ocr_grid(frame, tiles=tiles),
+                grid=build_camera_ocr_grid(frame, tiles=tiles, calibration_corners=calibration_corners),
             )
 
     raw_result = ocr_reader(frame) if ocr_reader is not None else read_frame_with_easyocr(frame)
@@ -403,7 +404,7 @@ def scan_camera_letters(
     boxes = camera_character_text_boxes(frame, boxes)
     return CameraLetterScanResult(
         letters=captured_letters_from_text_boxes(boxes),
-        grid=build_camera_ocr_grid(frame, text_boxes=boxes),
+        grid=build_camera_ocr_grid(frame, text_boxes=boxes, calibration_corners=calibration_corners),
     )
 
 
@@ -411,6 +412,7 @@ def scan_camera_words(
     frame,
     confidence_threshold: float = 50.0,
     ocr_reader: EasyOcrReader | None = None,
+    calibration_corners: list | None = None,
 ) -> CameraWordScanResult:  # type: ignore[no-untyped-def]
     detected_tiles = (
         detect_camera_tiles(frame, confidence_threshold=min(confidence_threshold, 15.0))
@@ -425,7 +427,7 @@ def scan_camera_words(
         identify_directional_tile_words(detected_tiles) + identify_directional_words(boxes)
     ))
     detected_words = _remove_contained_partial_words(detected_words)
-    grid = build_camera_ocr_grid(frame, tiles=detected_tiles, text_boxes=boxes)
+    grid = build_camera_ocr_grid(frame, tiles=detected_tiles, text_boxes=boxes, calibration_corners=calibration_corners)
     return CameraWordScanResult(
         words=detected_words,
         tiles=detected_tiles or text_box_tiles,
@@ -576,8 +578,15 @@ def build_camera_ocr_grid(
     tiles: list[CameraTile] | None = None,
     text_boxes: list[EasyOcrTextBox] | None = None,
     board_size: int = BOARD_SIZE,
+    calibration_corners: list | None = None,
 ) -> CameraOcrGrid | None:  # type: ignore[no-untyped-def]
-    corners = detect_board_grid_corners(frame)
+    # Prefer saved calibration corners over auto-detection to avoid grid drift.
+    if calibration_corners and len(calibration_corners) == 4:
+        corners: list[tuple[float, float]] | None = [
+            (float(pt[0]), float(pt[1])) for pt in calibration_corners
+        ]
+    else:
+        corners = detect_board_grid_corners(frame)
     if corners is None:
         return None
     cells = camera_grid_cells_from_ocr(

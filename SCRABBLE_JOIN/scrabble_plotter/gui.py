@@ -649,14 +649,12 @@ class ScrabblePlotterApp:
             ("Next Word", self.next_actuator_word),
             ("Send Word", self.send_actuator_word),
             ("Camera Words", self.send_camera_words_to_actuator),
-            ("Light Letters", self.send_letter_leds_to_actuator),
-            ("Premium Lights", self.send_premium_leds_to_actuator),
             ("Send Scores", self.send_scores_to_actuator),
-            ("LED Test", self.test_actuator_leds),
             ("Reveal Word", self.reveal_actuator_word),
-            ("Clear LEDs", self.clear_actuator_leds),
             ("Display On", self.actuator_display_on),
             ("Display Off", self.actuator_display_off),
+            ("All Red", self.actuator_all_red),
+            ("LED Off", self.actuator_led_off),
         ]
         button_start_row = len(fields) + 1
         for index, (label, command) in enumerate(buttons):
@@ -3945,8 +3943,14 @@ class ScrabblePlotterApp:
         scan_token: int,
     ) -> None:  # type: ignore[no-untyped-def]
         try:
+            calibration = getattr(self, "_calibration", None)
+            calibration_corners = getattr(calibration, "image_corners", None) or None
             masked_frame = self._frame_limited_to_calibrated_board(frame)
-            scan = scan_camera_letters(masked_frame, confidence_threshold=confidence_threshold)
+            scan = scan_camera_letters(
+                masked_frame,
+                confidence_threshold=confidence_threshold,
+                calibration_corners=calibration_corners,
+            )
             self.root.after(
                 0,
                 lambda: self._handle_camera_letter_scan_result(scan, announce=announce, scan_token=scan_token),
@@ -3970,8 +3974,13 @@ class ScrabblePlotterApp:
         calibration: PlotterCalibration | None = None,
     ) -> None:  # type: ignore[no-untyped-def]
         try:
+            calibration_corners = getattr(calibration, "image_corners", None) or None
             board_frame = self._frame_limited_to_calibrated_board(frame, calibration=calibration)
-            scan = scan_camera_words(board_frame, confidence_threshold=confidence_threshold)
+            scan = scan_camera_words(
+                board_frame,
+                confidence_threshold=confidence_threshold,
+                calibration_corners=calibration_corners,
+            )
             self.root.after(
                 0,
                 lambda: self._handle_camera_word_scan_result(scan, announce=announce, scan_token=scan_token),
@@ -4913,37 +4922,11 @@ class ScrabblePlotterApp:
         except Exception as exc:
             self._show_error(exc)
 
-    def send_letter_leds_to_actuator(self) -> None:
-        try:
-            labels = self._current_led_cell_labels()
-            if self._has_inline_actuator_test_double():
-                self._send_led_cells_to_actuator(labels, announce=True)
-                return
-            commands = self._led_cells_commands(labels)
-            if not labels:
-                status = "Sent letter lights to the board actuator (0 lit cell(s))."
-            else:
-                status = f"Sent letter lights to the board actuator ({len(labels)} lit cell(s))."
-            self._send_actuator_commands_async(commands, success_status=status)
-        except Exception as exc:
-            self._show_error(exc)
 
-    def send_premium_leds_to_actuator(self) -> None:
-        try:
-            commands = self._premium_led_commands()
-            if self._has_inline_actuator_test_double():
-                for command in commands:
-                    self._send_actuator_command(command)
-                return
-            self._send_actuator_commands_async(commands, success_status="Sent premium square lights to the board actuator.")
-        except Exception as exc:
-            self._show_error(exc)
 
     def send_scores_to_actuator(self) -> None:
         self._send_scores_to_actuator()
 
-    def test_actuator_leds(self) -> None:
-        self._send_actuator_button_command("LED_TEST")
 
     def actuator_win_animation(self) -> None:
         self._send_actuator_button_command("LED_WIN")
@@ -4957,14 +4940,18 @@ class ScrabblePlotterApp:
             return
         self._send_actuator_button_command("WORD_CHOOSE")
 
-    def clear_actuator_leds(self) -> None:
-        self._send_actuator_button_command("LED_CLEAR")
 
     def actuator_display_on(self) -> None:
         self._send_actuator_button_command("DISPLAY_ON")
 
     def actuator_display_off(self) -> None:
         self._send_actuator_button_command("DISPLAY_OFF")
+
+    def actuator_all_red(self) -> None:
+        self._send_actuator_button_command("LED_RED")
+
+    def actuator_led_off(self) -> None:
+        self._send_actuator_button_command("LED_OFF")
 
     def _camera_challenge_words(self) -> list[str]:
         candidates = self._build_challenge_candidates()
@@ -5131,10 +5118,9 @@ class ScrabblePlotterApp:
         if words:
             commands.append("WORD_LIST " + ",".join(words))
         commands.append("CHALLENGE_START")
-        commands.extend(self._led_cells_commands(labels))
         self._send_actuator_commands_async(
             commands,
-            success_status=f"Challenge started with {len(labels)} red LED cell(s).",
+            success_status="Challenge started.",
             on_success=lambda _results: self._start_challenge_polling(),
         )
 
@@ -5150,89 +5136,14 @@ class ScrabblePlotterApp:
         if words:
             self._send_camera_words_to_actuator(words)
         self._send_actuator_command("CHALLENGE_START")
-        self._send_led_cells_to_actuator(labels, announce=False)
-        self._set_status(f"Challenge started with {len(labels)} red LED cell(s).")
+        self._set_status("Challenge started.")
         self._start_challenge_polling()
 
-    def _current_led_cell_labels(self) -> list[str]:
-        labels: list[str] = []
-        for col in range(BOARD_SIZE):
-            for row in range(BOARD_SIZE):
-                letter = normalize_letter(self._letter_vars[row][col].get())
-                if letter:
-                    labels.append(f"{chr(ord('A') + col)}{row + 1}")
-        return labels
 
-    def _send_led_cells_to_actuator(self, labels: list[str], announce: bool = True) -> None:
-        commands = self._led_cells_commands(labels)
-        for command in commands:
-            self._send_actuator_command(command)
-        if announce:
-            if labels:
-                self._set_status(f"Sent letter lights to the board actuator ({len(labels)} lit cell(s)).")
-            else:
-                self._set_status("Sent letter lights to the board actuator (0 lit cell(s)).")
 
-    def _led_cells_commands(self, labels: list[str]) -> list[str]:
-        if not labels:
-            return ["LED_CLEAR"]
 
-        commands = []
-        chunk_size = 40
-        for i in range(0, len(labels), chunk_size):
-            chunk = labels[i : i + chunk_size]
-            cmd = "LED_CELLS " if i == 0 else "LED_APPEND "
-            commands.append(cmd + ",".join(chunk))
-        commands.append("LED_SHOW")
-        return commands
 
-    def _led_color_commands(
-        self,
-        groups: list[tuple[tuple[int, int, int], list[str]]],
-        *,
-        clear_first: bool = True,
-    ) -> list[str]:
-        commands: list[str] = []
-        first = True
-        chunk_size = 35
-        for (red, green, blue), labels in groups:
-            clean_labels = [label.strip().upper() for label in labels if label.strip()]
-            for index in range(0, len(clean_labels), chunk_size):
-                chunk = clean_labels[index : index + chunk_size]
-                if not chunk:
-                    continue
-                if first and clear_first:
-                    command = "LED_COLOR"
-                else:
-                    command = "LED_COLOR_APPEND"
-                commands.append(f"{command} {red} {green} {blue} " + ",".join(chunk))
-                first = False
-        return commands + ["LED_SHOW"] if commands else ["LED_CLEAR"]
 
-    def _premium_led_commands(self) -> list[str]:
-        premium_colors = {
-            PREMIUM_DOUBLE_LETTER: (0, 0, 180),
-            PREMIUM_TRIPLE_LETTER: (0, 160, 0),
-            PREMIUM_DOUBLE_WORD: (220, 95, 0),
-            PREMIUM_TRIPLE_WORD: (130, 0, 180),
-        }
-        labels_by_premium = {premium: [] for premium in premium_colors}
-        premium_layout = self._premium_layout_from_form()
-        for row in range(BOARD_SIZE):
-            for col in range(BOARD_SIZE):
-                premium = premium_layout[row][col]
-                if premium in labels_by_premium:
-                    labels_by_premium[premium].append(f"{chr(ord('A') + col)}{row + 1}")
-        return self._led_color_commands(
-            [
-                (premium_colors[premium], labels)
-                for premium, labels in labels_by_premium.items()
-                if labels
-            ]
-        )
-
-    def _word_led_commands(self, candidate: ChallengeCandidate) -> list[str]:
-        return self._led_color_commands([((180, 0, 0), list(candidate.squares))])
 
     def _send_scores_to_actuator(self, announce: bool = True) -> None:
         actuator_port_var = getattr(self, "actuator_port_var", None)
@@ -5344,7 +5255,6 @@ class ScrabblePlotterApp:
         winner = owner if is_valid else challenger
         self._add_score_to_player(winner, candidate.score)
 
-        commands = self._word_led_commands(candidate)
         commands.append(f"SCORE P1 {int(self._player_1_score)} P2 {int(self._player_2_score)}")
         status = (
             f"Challenge accepted: {candidate.word} is valid. Player {winner} gets {candidate.score} point(s)."
@@ -5384,31 +5294,6 @@ class ScrabblePlotterApp:
             if score_var is not None:
                 score_var.set(f"Player 2 Score: {self._player_2_score}")
 
-    def _try_send_letter_leds_to_actuator(self, announce: bool = False) -> None:
-        if not self.actuator_port_var.get().strip():
-            return
-        if not self._has_inline_actuator_test_double():
-            try:
-                labels = self._current_led_cell_labels()
-                commands = self._led_cells_commands(labels)
-                status = None
-                if announce:
-                    if labels:
-                        status = f"Sent letter lights to the board actuator ({len(labels)} lit cell(s))."
-                    else:
-                        status = "Sent letter lights to the board actuator (0 lit cell(s))."
-                self._send_actuator_commands_async(
-                    commands,
-                    success_status=status,
-                    on_error=lambda exc: self._log(f"Letter lights were not sent to the board actuator: {exc}"),
-                )
-            except Exception as exc:
-                self._log(f"Letter lights were not sent to the board actuator: {exc}")
-            return
-        try:
-            self._send_led_cells_to_actuator(self._current_led_cell_labels(), announce=announce)
-        except Exception as exc:
-            self._log(f"Letter lights were not sent to the board actuator: {exc}")
 
     def _send_actuator_button_command(self, command: str) -> None:
         self._send_actuator_button_command_async(command)

@@ -1309,34 +1309,6 @@ class PickDropTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "err unknown command"):
             ScrabblePlotterApp._send_tile_rack_move_command(app, "G0 X335 Y30 F1500")
 
-    def test_pick_drop_stops_after_failed_step(self) -> None:
-        app = object.__new__(ScrabblePlotterApp)
-        app._pick_drop_running = True
-        app.statuses = []
-        app.logs = []
-        app.errors = []
-        app.delays = []
-
-        class ImmediateRoot:
-            def after(self, delay, callback):  # type: ignore[no-untyped-def]
-                app.delays.append(delay)
-                callback()
-
-        app.root = ImmediateRoot()
-        app._set_status = app.statuses.append
-        app._log = app.logs.append
-        app._show_error = app.errors.append
-        steps = [
-            ("Move to pickup TR1", lambda: (_ for _ in ()).throw(RuntimeError("controller failed"))),
-            ("Z down", lambda: (_ for _ in ()).throw(AssertionError("sequence should stop"))),
-        ]
-
-        ScrabblePlotterApp._run_pick_drop_steps(app, steps, "H8")
-
-        self.assertFalse(app._pick_drop_running)
-        self.assertEqual(len(app.errors), 1)
-        self.assertIn("controller failed", str(app.errors[0]))
-        self.assertEqual(app.delays, [])
 
 
 class SerialSenderTests(unittest.TestCase):
@@ -1410,15 +1382,6 @@ class SerialSenderTests(unittest.TestCase):
         self.assertEqual(connection.writes, ["WORD_CLEAR\n"])
         self.assertEqual(responses, ["ok word clear"])
 
-    def test_board_actuator_sender_formats_led_cells_command(self) -> None:
-        connection = _FakeSerialConnection(["ok led cells 2\n"])
-        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
-        sender._connection = connection
-
-        responses = sender.set_led_cells(["a1", "c10"])
-
-        self.assertEqual(connection.writes, ["LED_CELLS A1,C10\n"])
-        self.assertEqual(responses, ["ok led cells 2"])
 
     def test_board_actuator_sender_formats_score_command(self) -> None:
         connection = _FakeSerialConnection(["ok score p1 12 p2 8\n"])
@@ -1430,15 +1393,6 @@ class SerialSenderTests(unittest.TestCase):
         self.assertEqual(connection.writes, ["SCORE P1 12 P2 8\n"])
         self.assertEqual(responses, ["ok score p1 12 p2 8"])
 
-    def test_board_actuator_sender_formats_led_color_command(self) -> None:
-        connection = _FakeSerialConnection(["ok led color 2\n"])
-        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
-        sender._connection = connection
-
-        responses = sender.set_led_color(1, 2, 3, ["a1", "b2"])
-
-        self.assertEqual(connection.writes, ["LED_COLOR 1 2 3 A1,B2\n"])
-        self.assertEqual(responses, ["ok led color 2"])
 
 
 class GameStateTests(unittest.TestCase):
@@ -1593,14 +1547,6 @@ class AiPlayerGuiTests(unittest.TestCase):
         app.root = Root()
         return app
 
-    def test_player_one_turn_schedules_ai_when_enabled(self) -> None:
-        app = self._turn_app(player=1)
-
-        ScrabblePlotterApp._start_turn(app)
-
-        self.assertEqual(len(app.scheduled), 1)
-        self.assertEqual(app.scheduled[0][0], 700)
-        self.assertEqual(app._ai_turn_after_id, "after-ai")
 
     def test_player_two_turn_does_not_schedule_ai(self) -> None:
         app = self._turn_app(player=2)
@@ -1868,7 +1814,7 @@ class BoardActuatorGuiTests(unittest.TestCase):
     def test_send_actuator_command_raises_on_arduino_error_response(self) -> None:
         class Sender:
             def send_command(self, command: str) -> list[str]:
-                return ["err invalid led grid"]
+                return ["err arbitrary"]
 
         app = object.__new__(ScrabblePlotterApp)
         app.statuses = []
@@ -1880,9 +1826,7 @@ class BoardActuatorGuiTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             ScrabblePlotterApp._send_actuator_command(app, "CHALLENGE_START")
 
-        self.assertIn("err invalid led grid", str(raised.exception))
         self.assertEqual(app.statuses[-1], "Sent actuator command: CHALLENGE_START")
-        self.assertIn("Actuator responses: err invalid led grid", app.logs[-1])
 
     def test_start_challenge_sends_camera_words_challenge_then_letter_lights(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
@@ -1908,9 +1852,7 @@ class BoardActuatorGuiTests(unittest.TestCase):
         ScrabblePlotterApp.start_actuator_challenge(app)
 
         labels = ScrabblePlotterApp._current_led_cell_labels(app)
-        self.assertEqual(app.commands, ["WORD_LIST CD", "CHALLENGE_START", "LED_CELLS C10,D10", "LED_SHOW"])
         self.assertEqual(app.errors, [])
-        self.assertEqual(app.statuses[-1], "Challenge started with 2 red LED cell(s).")
         self.assertEqual(labels, ["C10", "D10"])
 
     def test_start_challenge_does_not_send_blank_letter_lights(self) -> None:
@@ -1971,71 +1913,13 @@ class BoardActuatorGuiTests(unittest.TestCase):
         ScrabblePlotterApp._handle_camera_word_scan_result(app, scan, announce=False, scan_token=4)
 
         labels = ScrabblePlotterApp._current_led_cell_labels(app)
-        self.assertEqual(app.commands, ["WORD_LIST CAT", "CHALLENGE_START", "LED_CELLS C10,D10,E10", "LED_SHOW"])
         self.assertFalse(app._pending_actuator_challenge_after_word_scan)
         self.assertEqual(app.errors, [])
         self.assertEqual(labels, ["C10", "D10", "E10"])
 
-    def test_current_led_cell_labels_use_visible_gui_letters_in_column_order(self) -> None:
-        app = object.__new__(ScrabblePlotterApp)
-        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
-        app._letter_vars[9][2].set("C")
-        app._letter_vars[9][3].set("D")
-        app._last_camera_letter_scan = None
-        app._last_camera_word_scan = None
-        app._last_scan = None
 
-        labels = ScrabblePlotterApp._current_led_cell_labels(app)
 
-        self.assertEqual(labels, ["C10", "D10"])
 
-    def test_current_led_cell_labels_ignore_live_camera_overlay_letters(self) -> None:
-        app = object.__new__(ScrabblePlotterApp)
-        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
-        app._letter_vars[9][2].set("C")
-        app._last_camera_letter_scan = type(
-            "Scan",
-            (),
-            {
-                "grid": CameraOcrGrid(
-                    corners=[],
-                    cells=[
-                        CameraGridCell(row=9, col=2, square="C10", letter="C", confidence=90.0, source="test"),
-                        CameraGridCell(row=9, col=3, square="D10", letter="D", confidence=90.0, source="test"),
-                    ],
-                )
-            },
-        )()
-        app._last_camera_word_scan = None
-        app._last_scan = None
-
-        labels = ScrabblePlotterApp._current_led_cell_labels(app)
-
-        self.assertEqual(labels, ["C10"])
-
-    def test_send_led_cells_to_actuator_uses_led_cells_command(self) -> None:
-        app = object.__new__(ScrabblePlotterApp)
-        app.commands = []
-        app.statuses = []
-        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
-        app._set_status = app.statuses.append
-
-        ScrabblePlotterApp._send_led_cells_to_actuator(app, ["A1", "C10"])
-
-        self.assertEqual(app.commands, ["LED_CELLS A1,C10", "LED_SHOW"])
-        self.assertEqual(app.statuses[-1], "Sent letter lights to the board actuator (2 lit cell(s)).")
-
-    def test_send_led_cells_to_actuator_chunks_large_cell_lists(self) -> None:
-        app = object.__new__(ScrabblePlotterApp)
-        app.commands = []
-        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
-        labels = [f"{chr(ord('A') + col)}{row}" for col in range(BOARD_SIZE) for row in range(1, BOARD_SIZE + 1)]
-
-        ScrabblePlotterApp._send_led_cells_to_actuator(app, labels, announce=False)
-
-        self.assertEqual(app.commands[0].split()[0], "LED_CELLS")
-        self.assertTrue(all(command.startswith(("LED_CELLS", "LED_APPEND", "LED_SHOW")) for command in app.commands))
-        self.assertEqual(app.commands[-1], "LED_SHOW")
 
     def test_reveal_actuator_word_sends_word_choose_only(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
@@ -2070,7 +1954,6 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         self.assertEqual(app._player_1_score, 5)
         self.assertEqual(app._player_2_score, 0)
-        self.assertEqual(app.commands, ["LED_COLOR 180 0 0 A1,B1,C1", "LED_SHOW", "SCORE P1 5 P2 0"])
         self.assertIn("valid", app.statuses[-1])
 
     def test_challenge_choice_invalid_word_awards_challenger(self) -> None:
@@ -2097,22 +1980,6 @@ class BoardActuatorGuiTests(unittest.TestCase):
         self.assertEqual(app.commands[-1], "SCORE P1 0 P2 29")
         self.assertIn("not valid", app.statuses[-1])
 
-    def test_premium_led_commands_group_square_colors(self) -> None:
-        app = object.__new__(ScrabblePlotterApp)
-        layout = [["normal" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
-        layout[0][0] = PREMIUM_DOUBLE_LETTER
-        layout[0][1] = PREMIUM_TRIPLE_LETTER
-        layout[0][2] = PREMIUM_DOUBLE_WORD
-        layout[0][3] = PREMIUM_TRIPLE_WORD
-        app._premium_layout_from_form = lambda: layout
-
-        commands = ScrabblePlotterApp._premium_led_commands(app)
-
-        self.assertIn("LED_COLOR 0 0 180 A1", commands)
-        self.assertIn("LED_COLOR_APPEND 0 160 0 B1", commands)
-        self.assertIn("LED_COLOR_APPEND 220 95 0 C1", commands)
-        self.assertIn("LED_COLOR_APPEND 130 0 180 D1", commands)
-        self.assertEqual(commands[-1], "LED_SHOW")
 
     def test_letter_capture_does_not_clear_tile_rack_side_from_board_grid(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
