@@ -26,6 +26,12 @@ from .openai_agent import (
     PlotterAgentAction,
 )
 from .image_calibration import collect_board_corners_from_frame
+from .live_dashboard import (
+    DEFAULT_DASHBOARD_PORT,
+    LiveDashboardServer,
+    build_match_snapshot,
+    dashboard_urls,
+)
 from .overlay import draw_camera_ocr_overlay
 from .scanner import (
     BoardScanResult,
@@ -77,6 +83,9 @@ PICK_DROP_MAGNET_DELAY_MS = 1000
 PICK_DROP_MOVE_DELAY_MS = 1000
 PICK_DROP_Z_SETTLE_DELAY_MS = 1000
 CHALLENGE_POLL_INTERVAL_MS = 500
+TILE_CART_CALIBRATION_PWM = 35.0
+TILE_CART_SECONDS_PER_CM_AT_CALIBRATION_PWM = 0.130
+TILE_CART_HTTP_OVERHEAD_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -137,10 +146,12 @@ class ScrabblePlotterApp:
             value=str(self._calibration.actuator_countdown_seconds)
         )
         self.actuator_word_var = tk.StringVar(value="")
+        self.actuator_light_squares_var = tk.StringVar(value="")
         self.tile_cart_url_var = tk.StringVar(value=self._calibration.tile_cart_url)
         self.tile_cart_player_1_command_var = tk.StringVar(value=self._calibration.tile_cart_player_1_command)
         self.tile_cart_player_2_command_var = tk.StringVar(value=self._calibration.tile_cart_player_2_command)
         self.tile_cart_enabled_var = tk.BooleanVar(value=True)
+        self.tile_cart_speed_pwm_var = tk.StringVar(value=str(self._calibration.tile_cart_speed_pwm))
         self.tile_cart_distance_cm_var = tk.StringVar(value=str(self._calibration.tile_cart_distance_cm))
         self.openai_endpoint_var = tk.StringVar(value=os.environ.get("OPENAI_ENDPOINT", DEFAULT_OPENAI_ENDPOINT))
         self.openai_api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
@@ -174,6 +185,7 @@ class ScrabblePlotterApp:
         self._camera_word_scan_running = False
         self._pending_actuator_challenge_after_word_scan = False
         self._challenge_candidates: list[ChallengeCandidate] = []
+        self._challenge_candidate_index = 0
         self._challenge_poll_after_id: str | None = None
         self._challenge_polling = False
         self.camera_words_text: tk.Text | None = None
@@ -185,6 +197,8 @@ class ScrabblePlotterApp:
         self._player_2_cells: set[str] = set()
         self._previous_board_state: dict[str, str] = {}
         self._timer_running = False
+        self._game_started = False
+        self._turn_scanning = False
         self._timer_display_var = tk.StringVar(value="Time Remaining: 2:00")
         self._current_player_display_var = tk.StringVar(value="Current Player: -")
         self._player_1_score = 0
@@ -200,6 +214,7 @@ class ScrabblePlotterApp:
         self._turn_scan_detected_words: list[str] = []
         self._tile_cart_player_position: int | None = None
         self._tile_cart_move_running = False
+        self._pending_turn_cart_player: int | None = None
 
         self.status_var = tk.StringVar(
             value="Start the camera to find visible words."
@@ -228,10 +243,13 @@ class ScrabblePlotterApp:
         self._actuator_sender: BoardActuatorSender | None = None
         self._actuator_sender_key: tuple[str, int, float] | None = None
         self._serial_lock = threading.RLock()
+        self._dashboard_server: LiveDashboardServer | None = None
+        self._dashboard_address_var = tk.StringVar(value="Website feed: starting...")
 
         self._build_ui()
         self.refresh_ports()
         self.load_calibration_into_form()
+        self._start_live_dashboard_server()
 
     def _run_background_task(
         self,
@@ -574,19 +592,31 @@ class ScrabblePlotterApp:
             ttk.Label(cart_box, text=label).grid(row=index, column=0, sticky="w", pady=2)
             ttk.Entry(cart_box, textvariable=variable).grid(row=index, column=1, sticky="ew", padx=(8, 0), pady=2)
 
-        ttk.Label(cart_box, text="Distance (cm)").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Label(cart_box, text="Speed (PWM)").grid(row=4, column=0, sticky="w", pady=2)
+        speed_frame = ttk.Frame(cart_box)
+        speed_frame.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=2)
+        speed_frame.columnconfigure(0, weight=1)
+
+        ttk.Entry(speed_frame, textvariable=self.tile_cart_speed_pwm_var).grid(row=0, column=0, sticky="ew")
+        ttk.Button(speed_frame, text="Apply Settings", command=self.set_tile_cart_speed).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+
+        ttk.Label(cart_box, text="Distance (cm)").grid(row=5, column=0, sticky="w", pady=2)
         dist_frame = ttk.Frame(cart_box)
-        dist_frame.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=2)
+        dist_frame.grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=2)
         dist_frame.columnconfigure(0, weight=1)
 
         ttk.Entry(dist_frame, textvariable=self.tile_cart_distance_cm_var).grid(row=0, column=0, sticky="ew")
-        ttk.Button(dist_frame, text="Set Distance", command=self.set_tile_cart_distance).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(dist_frame, text="Apply Settings", command=self.set_tile_cart_distance).grid(
+            row=0, column=1, padx=(6, 0)
+        )
 
         ttk.Button(cart_box, text="Move To Player", command=self.move_tile_cart_to_current_player).grid(
-            row=5, column=0, sticky="ew", pady=(6, 0), padx=(0, 4)
+            row=6, column=0, sticky="ew", pady=(6, 0), padx=(0, 4)
         )
         ttk.Button(cart_box, text="Stop Cart", command=lambda: self.send_tile_cart_command("stop")).grid(
-            row=5, column=1, sticky="ew", pady=(6, 0), padx=(4, 0)
+            row=6, column=1, sticky="ew", pady=(6, 0), padx=(4, 0)
         )
 
         self.words_table = ttk.Treeview(game_box, columns=("P1", "P2"), show="headings", height=6)
@@ -595,6 +625,11 @@ class ScrabblePlotterApp:
         self.words_table.column("P1", width=140, anchor="center")
         self.words_table.column("P2", width=140, anchor="center")
         self.words_table.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            game_box,
+            textvariable=self._dashboard_address_var,
+            wraplength=380,
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         log_box = ttk.LabelFrame(controls, text="Status", padding=10)
         log_box.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
@@ -628,6 +663,7 @@ class ScrabblePlotterApp:
             ("Timeout", self.actuator_timeout_var),
             ("Countdown s", self.actuator_countdown_seconds_var),
             ("Word", self.actuator_word_var),
+            ("Letter squares", self.actuator_light_squares_var),
         ]
         for index, (label, variable) in enumerate(fields, start=1):
             ttk.Label(actuator_box, text=label).grid(row=index, column=0, sticky="w", pady=2)
@@ -653,8 +689,9 @@ class ScrabblePlotterApp:
             ("Reveal Word", self.reveal_actuator_word),
             ("Display On", self.actuator_display_on),
             ("Display Off", self.actuator_display_off),
-            ("All Red", self.actuator_all_red),
-            ("LED Off", self.actuator_led_off),
+            ("Light Letters", self.actuator_light_letters),
+            ("Light Test", self.actuator_light_test),
+            ("Lights Off", self.actuator_lights_off),
         ]
         button_start_row = len(fields) + 1
         for index, (label, command) in enumerate(buttons):
@@ -705,6 +742,7 @@ class ScrabblePlotterApp:
         self.tile_cart_url_var.set(self._calibration.tile_cart_url)
         self.tile_cart_player_1_command_var.set(self._calibration.tile_cart_player_1_command)
         self.tile_cart_player_2_command_var.set(self._calibration.tile_cart_player_2_command)
+        self.tile_cart_speed_pwm_var.set(str(self._calibration.tile_cart_speed_pwm))
         self.tile_cart_distance_cm_var.set(str(self._calibration.tile_cart_distance_cm))
         self._load_premium_layout_into_form()
         if len(self._calibration.image_corners) == 4:
@@ -4569,9 +4607,15 @@ class ScrabblePlotterApp:
         calibration.tile_cart_player_1_command = self.tile_cart_player_1_command_var.get().strip() or "backward"
         calibration.tile_cart_player_2_command = self.tile_cart_player_2_command_var.get().strip() or "forward"
         try:
+            calibration.tile_cart_speed_pwm = int(self.tile_cart_speed_pwm_var.get())
+        except Exception:
+            calibration.tile_cart_speed_pwm = 200
+        if not 1 <= calibration.tile_cart_speed_pwm <= 255:
+            raise ValueError("Tile cart PWM speed must be between 1 and 255.")
+        try:
             calibration.tile_cart_distance_cm = float(self.tile_cart_distance_cm_var.get())
         except Exception:
-            calibration.tile_cart_distance_cm = 30.0
+            calibration.tile_cart_distance_cm = 5.0
         calibration.premium_layout = self._premium_layout_from_form()
         return calibration
 
@@ -4698,7 +4742,10 @@ class ScrabblePlotterApp:
                     responses = sender.send_command(command)
                     for response in responses:
                         if response.lower().startswith("err"):
-                            if "unknown command led_show" in response.lower():
+                            if (
+                                "unknown command led_show" in response.lower()
+                                or "unknown command word_cells" in response.lower()
+                            ):
                                 continue
                             raise RuntimeError(f"Board Actuator Arduino error: {response}")
                     results.append((command, responses))
@@ -4760,7 +4807,10 @@ class ScrabblePlotterApp:
             self._log("Actuator responses: " + " | ".join(responses))
         for response in responses:
             if response.lower().startswith("err"):
-                if "unknown command led_show" in response.lower():
+                if (
+                    "unknown command led_show" in response.lower()
+                    or "unknown command word_cells" in response.lower()
+                ):
                     continue
                 raise RuntimeError(f"Board Actuator Arduino error: {response}")
         return responses
@@ -4807,7 +4857,7 @@ class ScrabblePlotterApp:
         try:
             if getattr(self, "_camera_word_scan_running", False):
                 self._pending_actuator_challenge_after_word_scan = True
-                self._set_status("Waiting for the current camera scan, then the challenge LEDs will update.")
+                self._set_status("Waiting for the current camera scan, then the challenge lights will update.")
                 return
 
             confidence_threshold = self._ocr_confidence_threshold()
@@ -4854,7 +4904,7 @@ class ScrabblePlotterApp:
         try:
             if getattr(self, "_camera_word_scan_running", False):
                 self._pending_actuator_challenge_after_word_scan = True
-                self._set_status("Waiting for the current camera scan, then the challenge LEDs will update.")
+                self._set_status("Waiting for the current camera scan, then the challenge lights will update.")
                 return
 
             try:
@@ -4889,10 +4939,30 @@ class ScrabblePlotterApp:
         self._send_actuator_button_command("CHALLENGE_CANCEL")
 
     def previous_actuator_word(self) -> None:
-        self._send_actuator_button_command("WORD_PREV")
+        self._step_actuator_word(-1, "WORD_PREV")
 
     def next_actuator_word(self) -> None:
-        self._send_actuator_button_command("WORD_NEXT")
+        self._step_actuator_word(1, "WORD_NEXT")
+
+    def _step_actuator_word(self, direction: int, word_command: str) -> None:
+        candidates = getattr(self, "_challenge_candidates", [])
+        if not candidates:
+            self._send_actuator_button_command(word_command)
+            return
+
+        current_index = int(getattr(self, "_challenge_candidate_index", 0))
+        current_index = (current_index + direction) % len(candidates)
+        self._challenge_candidate_index = current_index
+        candidate = candidates[current_index]
+        commands = [word_command, self._led_cells_command(candidate.squares)]
+        status = f"Selected {candidate.word}; lit {len(candidate.squares)} letter square(s)."
+
+        if self._has_inline_actuator_test_double():
+            for command in commands:
+                self._send_actuator_command(command)
+            self._set_status(status)
+            return
+        self._send_actuator_commands_async(commands, success_status=status)
 
     def send_actuator_word(self) -> None:
         try:
@@ -4928,9 +4998,6 @@ class ScrabblePlotterApp:
         self._send_scores_to_actuator()
 
 
-    def actuator_win_animation(self) -> None:
-        self._send_actuator_button_command("LED_WIN")
-
     def reveal_actuator_word(self) -> None:
         if self._has_inline_actuator_test_double():
             try:
@@ -4947,11 +5014,74 @@ class ScrabblePlotterApp:
     def actuator_display_off(self) -> None:
         self._send_actuator_button_command("DISPLAY_OFF")
 
-    def actuator_all_red(self) -> None:
-        self._send_actuator_button_command("LED_RED")
+    def actuator_light_letters(self) -> None:
+        try:
+            squares, description = self._actuator_letter_squares()
+            command = self._led_cells_command(squares)
+            status = f"Lit {len(squares)} letter square(s) for {description}."
+            if self._has_inline_actuator_test_double():
+                self._send_actuator_command(command)
+                self._set_status(status)
+                return
+            self._send_actuator_button_command_async(command, status)
+        except Exception as exc:
+            self._show_error(exc)
 
-    def actuator_led_off(self) -> None:
-        self._send_actuator_button_command("LED_OFF")
+    def _actuator_letter_squares(self) -> tuple[tuple[str, ...], str]:
+        manual_var = getattr(self, "actuator_light_squares_var", None)
+        manual_text = manual_var.get().strip() if manual_var is not None else ""
+        if manual_text:
+            labels: list[str] = []
+            seen: set[str] = set()
+            for token in manual_text.replace(",", " ").replace(";", " ").split():
+                label = parse_square_label(token).label
+                if label not in seen:
+                    seen.add(label)
+                    labels.append(label)
+            if not labels:
+                raise ValueError("Enter at least one letter square from A1 to L12.")
+            return tuple(labels), "the selected cells"
+
+        candidates = self._build_challenge_candidates(limit=10)
+        word_var = getattr(self, "actuator_word_var", None)
+        requested_word = normalize_word(word_var.get()) if word_var is not None else ""
+        if requested_word:
+            for candidate in candidates:
+                if candidate.word == requested_word:
+                    return candidate.squares, candidate.word
+            raise ValueError(
+                f"{requested_word} was not found in the board letter grid. "
+                "Enter its squares in Letter squares, such as A1,B1,C1."
+            )
+
+        if candidates:
+            return candidates[0].squares, candidates[0].word
+        raise ValueError(
+            "No board word is available to light. Enter Letter squares such as A1,B1,C1, "
+            "or capture the board letters first."
+        )
+
+    @staticmethod
+    def _led_cells_command(squares: tuple[str, ...] | list[str]) -> str:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for square in squares:
+            label = parse_square_label(square).label
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+        if not labels:
+            raise ValueError("No letter squares were selected to light.")
+        command = "LED_CELLS " + ",".join(labels)
+        if len(command) >= 200:
+            raise ValueError("Too many letter squares for one Arduino command. Select fewer squares.")
+        return command
+
+    def actuator_light_test(self) -> None:
+        self._send_actuator_button_command("LED_TEST")
+
+    def actuator_lights_off(self) -> None:
+        self._send_actuator_button_command("LED_CLEAR")
 
     def _camera_challenge_words(self) -> list[str]:
         candidates = self._build_challenge_candidates()
@@ -5069,12 +5199,19 @@ class ScrabblePlotterApp:
     def _try_send_camera_words_to_actuator(self) -> None:
         if not self.actuator_port_var.get().strip():
             return
-        words = self._camera_challenge_words()
+        candidates = self._build_challenge_candidates(limit=10)
+        words = (
+            [candidate.word for candidate in candidates]
+            if candidates
+            else self._camera_words_from_scan(self._last_camera_word_scan, limit=10)
+        )
+        commands = self._challenge_setup_commands(candidates) if candidates else []
+        if words and not commands:
+            commands = ["WORD_CLEAR", "WORD_LIST " + ",".join(words)]
         if not self._has_inline_actuator_test_double():
             if words:
-                command = "WORD_LIST " + ",".join(words)
                 status = f"Sent {len(words)} camera word(s) to the board actuator challenge list."
-                self._send_actuator_commands_async([command], success_status=status)
+                self._send_actuator_commands_async(commands, success_status=status)
             else:
                 self._send_actuator_commands_async(
                     ["WORD_CLEAR"],
@@ -5087,7 +5224,9 @@ class ScrabblePlotterApp:
             return
         try:
             if words:
-                self._send_camera_words_to_actuator(words)
+                for command in commands:
+                    self._send_actuator_command(command)
+                self._set_status(f"Sent {len(words)} camera word(s) to the board actuator challenge list.")
             else:
                 self._send_actuator_command("WORD_CLEAR")
                 self._log("Cleared board actuator challenge words because the camera found none.")
@@ -5105,39 +5244,62 @@ class ScrabblePlotterApp:
             self._show_error(exc)
 
     def _send_actuator_challenge_from_current_grid_async(self) -> None:
-        self._challenge_candidates = self._build_challenge_candidates()
-        labels = sorted({square for candidate in self._challenge_candidates for square in candidate.squares})
-        if not labels:
+        self._challenge_candidates = self._build_challenge_candidates(limit=10)
+        self._challenge_candidate_index = 0
+        if not self._challenge_candidates:
             self._show_error(
-                ValueError("No board letters were found for the challenge LEDs. Start the camera or run Find Words first.")
+                ValueError("No board words were found for the challenge. Start the camera or run Find Words first.")
             )
             return
 
-        commands = []
-        words = [candidate.word for candidate in self._challenge_candidates]
-        if words:
-            commands.append("WORD_LIST " + ",".join(words))
-        commands.append("CHALLENGE_START")
+        commands = self._challenge_commands(self._challenge_candidates)
+        first = self._challenge_candidates[0]
+        status = (
+            f"Challenge started: sent {len(self._challenge_candidates)} board word(s) "
+            f"to the display and lit {first.word}."
+        )
         self._send_actuator_commands_async(
             commands,
-            success_status="Challenge started.",
+            success_status=status,
             on_success=lambda _results: self._start_challenge_polling(),
         )
 
     def _send_actuator_challenge_from_current_grid(self) -> None:
-        self._challenge_candidates = self._build_challenge_candidates()
-        labels = sorted({square for candidate in self._challenge_candidates for square in candidate.squares})
-        if not labels:
+        self._challenge_candidates = self._build_challenge_candidates(limit=10)
+        self._challenge_candidate_index = 0
+        if not self._challenge_candidates:
             raise ValueError(
-                "No board letters were found for the challenge LEDs. Start the camera or run Find Words first."
+                "No board words were found for the challenge. Start the camera or run Find Words first."
             )
 
-        words = [candidate.word for candidate in self._challenge_candidates]
-        if words:
-            self._send_camera_words_to_actuator(words)
-        self._send_actuator_command("CHALLENGE_START")
-        self._set_status("Challenge started.")
+        for command in self._challenge_commands(self._challenge_candidates):
+            self._send_actuator_command(command)
+        first = self._challenge_candidates[0]
+        self._set_status(
+            f"Challenge started: sent {len(self._challenge_candidates)} board word(s) "
+            f"to the display and lit {first.word}."
+        )
         self._start_challenge_polling()
+
+    @staticmethod
+    def _challenge_setup_commands(candidates: list[ChallengeCandidate]) -> list[str]:
+        commands = ["WORD_CLEAR"]
+        selected = candidates[:10]
+        if selected:
+            commands.append("WORD_LIST " + ",".join(candidate.word for candidate in selected))
+        for index, candidate in enumerate(selected):
+            if candidate.squares:
+                commands.append(f"WORD_CELLS {index} " + ",".join(candidate.squares))
+        return commands
+
+    @staticmethod
+    def _challenge_commands(candidates: list[ChallengeCandidate]) -> list[str]:
+        commands = ScrabblePlotterApp._challenge_setup_commands(candidates)
+        commands.append("CHALLENGE_START")
+        selected = candidates[:10]
+        if selected and selected[0].squares:
+            commands.append(ScrabblePlotterApp._led_cells_command(selected[0].squares))
+        return commands
 
 
 
@@ -5255,7 +5417,7 @@ class ScrabblePlotterApp:
         winner = owner if is_valid else challenger
         self._add_score_to_player(winner, candidate.score)
 
-        commands.append(f"SCORE P1 {int(self._player_1_score)} P2 {int(self._player_2_score)}")
+        commands = [f"SCORE P1 {int(self._player_1_score)} P2 {int(self._player_2_score)}"]
         status = (
             f"Challenge accepted: {candidate.word} is valid. Player {winner} gets {candidate.score} point(s)."
             if is_valid
@@ -5369,11 +5531,42 @@ class ScrabblePlotterApp:
         self._log(f"Connected to {config.port} at {config.baud} baud.")
         return self._sender
 
+    def _start_live_dashboard_server(self) -> None:
+        host = os.environ.get("SCRABLIFY_DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0"
+        try:
+            port = int(os.environ.get("SCRABLIFY_DASHBOARD_PORT", str(DEFAULT_DASHBOARD_PORT)))
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            port = DEFAULT_DASHBOARD_PORT
+
+        server = LiveDashboardServer(
+            lambda: build_match_snapshot(self),
+            host=host,
+            port=port,
+        )
+        try:
+            server.start()
+        except OSError as exc:
+            self._dashboard_address_var.set(f"Website feed unavailable on port {port}")
+            self._log(f"Could not start website feed on port {port}: {exc}")
+            return
+
+        self._dashboard_server = server
+        urls = dashboard_urls(port)
+        address = urls[0] if urls else f"http://<this-computer-IP>:{port}"
+        self._dashboard_address_var.set(f"Website feed: {address}")
+        self._log(f"Live website feed ready at {address}/api/match")
+
     def _on_close(self) -> None:
         self.stop_camera(clear_preview=False)
         try:
             self._send_shutdown_board_down()
         finally:
+            dashboard_server = getattr(self, "_dashboard_server", None)
+            if dashboard_server is not None:
+                dashboard_server.close()
+                self._dashboard_server = None
             if self._actuator_sender is not None:
                 self._actuator_sender.close()
                 self._actuator_sender = None
@@ -5605,6 +5798,8 @@ class ScrabblePlotterApp:
         return message
 
     def _start_game(self) -> None:
+        self._game_started = True
+        self._turn_scanning = False
         self._current_player = 1
         self._tile_cart_player_position = None
         self._ai_player_running = False
@@ -5637,15 +5832,58 @@ class ScrabblePlotterApp:
         self._start_turn()
 
     def _start_turn(self) -> None:
-        self._current_player_display_var.set(f"Current Player: {self._current_player}")
+        self._turn_scanning = False
         self._turn_start_board_state = dict(self._previous_board_state)
-        self._start_cart_movement_countdown()
+        player_id = self._current_player_id()
+        self._current_player = player_id
+
+        if self._tile_cart_enabled() and self._tile_cart_player_position != player_id:
+            self._pending_turn_cart_player = player_id
+            self._pause_turn_until_cart_arrives(player_id)
+            self._start_cart_movement_countdown()
+            return
+
+        self._pending_turn_cart_player = None
+        self._begin_turn_after_cart_arrival(player_id)
+
+    def _pause_turn_until_cart_arrives(self, player_id: int) -> None:
+        self._timer_running = False
+        timer_after_id = getattr(self, "_timer_after_id", None)
+        if timer_after_id:
+            try:
+                self.root.after_cancel(timer_after_id)
+            except Exception:
+                pass
+            self._timer_after_id = None
+
+        self._current_player_display_var.set(f"Current Player: {player_id} (Waiting for tile cart)")
+        timer_display_var = getattr(self, "_timer_display_var", None)
+        if timer_display_var is not None:
+            timer_display_var.set("Waiting for tile cart...")
+        self._set_status(f"Moving tile cart to Player {player_id} before rack filling starts...")
+        self._log(f"Player {player_id} is waiting for the tile cart before filling the rack.")
+
+    def _begin_turn_after_cart_arrival(self, player_id: int) -> None:
+        if self._current_player_id() != player_id:
+            return
+        self._current_player_display_var.set(f"Current Player: {player_id}")
         import time
         self._turn_end_time = time.time() + 120.0
         if not self._timer_running:
             self._timer_running = True
             self._update_timer()
+        if self._tile_cart_enabled():
+            self._set_status(f"Tile cart is ready for Player {player_id}. Rack filling can start.")
+            self._log(f"Tile cart arrived for Player {player_id}; rack filling is now enabled.")
         self._schedule_ai_player_if_needed()
+
+    def _resume_pending_turn_after_cart_arrival(self, player_id: int) -> None:
+        if getattr(self, "_pending_turn_cart_player", None) != player_id:
+            return
+        if self._current_player_id() != player_id:
+            return
+        self._pending_turn_cart_player = None
+        self._begin_turn_after_cart_arrival(player_id)
 
     def _schedule_ai_player_if_needed(self) -> None:
         if not self._should_auto_run_ai_player():
@@ -5694,6 +5932,7 @@ class ScrabblePlotterApp:
             return
         player_id = self._current_player_id()
         if self._tile_cart_player_position == player_id:
+            self._resume_pending_turn_after_cart_arrival(player_id)
             return
 
         if getattr(self, "_cart_countdown_after_id", None):
@@ -5701,11 +5940,9 @@ class ScrabblePlotterApp:
                 self.root.after_cancel(self._cart_countdown_after_id)
             except Exception:
                 pass
-
-        import time
-        self._cart_countdown_end_time = time.time() + 45.0
-        self._cart_countdown_running = True
-        self._update_cart_countdown()
+        self._cart_countdown_after_id = None
+        self._cart_countdown_running = False
+        self._move_tile_cart_for_current_player()
 
     def _update_cart_countdown(self) -> None:
         if not getattr(self, "_cart_countdown_running", False):
@@ -5738,6 +5975,7 @@ class ScrabblePlotterApp:
         try:
             command = self._normalize_tile_cart_command(command)
             url = self._tile_cart_url_for_command(command)
+            timeout_seconds = self._tile_cart_request_timeout(command)
         except Exception as exc:
             self._show_error(exc)
             return
@@ -5745,7 +5983,7 @@ class ScrabblePlotterApp:
         self._tile_cart_move_running = True
 
         def work() -> str:
-            with urllib.request.urlopen(url, timeout=5.0) as response:
+            with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
                 return response.read().decode("utf-8", errors="replace").strip()
 
         def done(message: str) -> None:
@@ -5753,9 +5991,13 @@ class ScrabblePlotterApp:
             if player_id in (1, 2):
                 self._tile_cart_player_position = player_id
                 self._set_status(f"Tile cart moved for Player {player_id}.")
+                self._resume_pending_turn_after_cart_arrival(player_id)
             else:
                 self._set_status(f"Tile cart command sent: {command}.")
             self._log(f"Tile cart {command}: {message or 'ok'}")
+            pending_player = getattr(self, "_pending_turn_cart_player", None)
+            if pending_player in (1, 2) and self._current_player_id() == pending_player:
+                self._move_tile_cart_for_current_player()
 
         def on_error(exc: Exception) -> None:
             self._tile_cart_move_running = False
@@ -5790,41 +6032,109 @@ class ScrabblePlotterApp:
         if not base_url.startswith(("http://", "https://")):
             base_url = "http://" + base_url
         normalized = self._normalize_tile_cart_command(command)
-        return base_url.rstrip("/") + "/" + urllib.parse.quote(normalized)
+        url = base_url.rstrip("/") + "/" + urllib.parse.quote(normalized)
+        if normalized == "stop":
+            return url
+
+        speed_pwm = int(self.tile_cart_speed_pwm_var.get().strip())
+        distance_cm = float(self.tile_cart_distance_cm_var.get().strip())
+        if not 1 <= speed_pwm <= 255:
+            raise ValueError("Tile cart PWM speed must be between 1 and 255.")
+        if distance_cm <= 0:
+            raise ValueError("Tile cart distance must be greater than 0 cm.")
+        query = urllib.parse.urlencode({"speed": speed_pwm, "distance": distance_cm})
+        return url + "?" + query
+
+    def _tile_cart_request_timeout(self, command: str) -> float:
+        if self._normalize_tile_cart_command(command) == "stop":
+            return TILE_CART_HTTP_OVERHEAD_SECONDS
+        speed_pwm = int(self.tile_cart_speed_pwm_var.get().strip())
+        distance_cm = float(self.tile_cart_distance_cm_var.get().strip())
+        if not 1 <= speed_pwm <= 255:
+            raise ValueError("Tile cart PWM speed must be between 1 and 255.")
+        if distance_cm <= 0:
+            raise ValueError("Tile cart distance must be greater than 0 cm.")
+        movement_seconds = (
+            distance_cm
+            * TILE_CART_SECONDS_PER_CM_AT_CALIBRATION_PWM
+            * TILE_CART_CALIBRATION_PWM
+            / speed_pwm
+        )
+        return max(TILE_CART_HTTP_OVERHEAD_SECONDS, movement_seconds + TILE_CART_HTTP_OVERHEAD_SECONDS)
+
+    def set_tile_cart_speed(self) -> None:
+        self._apply_tile_cart_motion_settings()
 
     def set_tile_cart_distance(self) -> None:
+        self._apply_tile_cart_motion_settings()
+
+    def _tile_cart_motion_settings_from_form(self) -> tuple[int, float]:
+        speed_text = self.tile_cart_speed_pwm_var.get().strip()
+        distance_text = self.tile_cart_distance_cm_var.get().strip()
+        if not speed_text:
+            raise ValueError("Enter the tile cart PWM speed.")
+        if not distance_text:
+            raise ValueError("Enter the tile cart distance in cm.")
+
+        speed_pwm = int(speed_text)
+        distance_cm = float(distance_text)
+        if not 1 <= speed_pwm <= 255:
+            raise ValueError("Tile cart PWM speed must be between 1 and 255.")
+        if distance_cm <= 0:
+            raise ValueError("Tile cart distance must be greater than 0 cm.")
+        return speed_pwm, distance_cm
+
+    def _tile_cart_base_url(self) -> str:
+        base_url = self.tile_cart_url_var.get().strip()
+        if not base_url:
+            raise ValueError("Enter the tile cart ESP32 URL.")
+        if not base_url.startswith(("http://", "https://")):
+            base_url = "http://" + base_url
+        return base_url.rstrip("/")
+
+    def _save_tile_cart_motion_settings(self, speed_pwm: int, distance_cm: float) -> None:
+        calibration = PlotterCalibration.load(self.calibration_path.get())
+        calibration.tile_cart_speed_pwm = speed_pwm
+        calibration.tile_cart_distance_cm = distance_cm
+        calibration.save(self.calibration_path.get())
+        self._calibration.tile_cart_speed_pwm = speed_pwm
+        self._calibration.tile_cart_distance_cm = distance_cm
+
+    def _apply_tile_cart_motion_settings(self) -> None:
         try:
-            distance_str = self.tile_cart_distance_cm_var.get().strip()
-            if not distance_str:
-                raise ValueError("Enter the tile cart distance in cm.")
-            distance_cm = float(distance_str)
-
-            # Update the calibration model and save it
-            self._calibration = self._calibration_from_form()
-            self._calibration.save(self.calibration_path.get())
-
-            base_url = self.tile_cart_url_var.get().strip()
-            if not base_url:
-                raise ValueError("Enter the tile cart ESP32 URL.")
-            if not base_url.startswith(("http://", "https://")):
-                base_url = "http://" + base_url
-            url = base_url.rstrip("/") + "/distance?val=" + urllib.parse.quote(str(distance_cm))
+            speed_pwm, distance_cm = self._tile_cart_motion_settings_from_form()
+            base_url = self._tile_cart_base_url()
+            speed_url = base_url + "/speed?val=" + urllib.parse.quote(str(speed_pwm))
+            distance_url = base_url + "/distance?val=" + urllib.parse.quote(str(distance_cm))
         except Exception as exc:
             self._show_error(exc)
             return
 
-        def work() -> str:
-            with urllib.request.urlopen(url, timeout=5.0) as response:
-                return response.read().decode("utf-8", errors="replace").strip()
+        def work() -> tuple[str, str]:
+            with urllib.request.urlopen(speed_url, timeout=5.0) as response:
+                speed_message = response.read().decode("utf-8", errors="replace").strip()
+            with urllib.request.urlopen(distance_url, timeout=5.0) as response:
+                distance_message = response.read().decode("utf-8", errors="replace").strip()
+            return speed_message, distance_message
 
-        def done(message: str) -> None:
-            self._set_status(f"Distance set to {distance_cm} cm.")
-            self._log(f"Tile cart set distance: {message or 'ok'}")
+        def done(messages: tuple[str, str]) -> None:
+            try:
+                self._save_tile_cart_motion_settings(speed_pwm, distance_cm)
+            except Exception as exc:
+                self._show_error(exc)
+                return
+            self._set_status(f"Cart settings applied: PWM {speed_pwm}, {distance_cm:g} cm.")
+            self._log(f"Tile cart settings: {messages[0] or 'ok'}; {messages[1] or 'ok'}")
 
         def on_error(exc: Exception) -> None:
             self._show_error(exc)
 
-        self._run_background_task(f"Setting tile cart distance to {distance_cm} cm...", work, done, on_error)
+        self._run_background_task(
+            f"Applying cart settings: PWM {speed_pwm}, {distance_cm:g} cm...",
+            work,
+            done,
+            on_error,
+        )
 
     def run_ai_player_turn(self) -> None:
         try:
@@ -6086,6 +6396,7 @@ class ScrabblePlotterApp:
         if self._timer_after_id:
             self.root.after_cancel(self._timer_after_id)
             self._timer_after_id = None
+        self._turn_scanning = True
         self._timer_display_var.set("Scanning Board...")
         self.identify_words_with_easyocr(force_new=True, freeze_preview=False, switch_after_scan=True)
 

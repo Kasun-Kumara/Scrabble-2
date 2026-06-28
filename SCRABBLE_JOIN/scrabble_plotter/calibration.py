@@ -75,7 +75,8 @@ class PlotterCalibration:
     tile_cart_url: str = "http://192.168.4.1"
     tile_cart_player_1_command: str = "backward"
     tile_cart_player_2_command: str = "forward"
-    tile_cart_distance_cm: float = 30.0
+    tile_cart_speed_pwm: int = 200
+    tile_cart_distance_cm: float = 5.0
 
     def set_image_corners(
         self,
@@ -187,6 +188,7 @@ class PlotterCalibration:
             "tile_cart_url": self.tile_cart_url,
             "tile_cart_player_1_command": self.tile_cart_player_1_command,
             "tile_cart_player_2_command": self.tile_cart_player_2_command,
+            "tile_cart_speed_pwm": self.tile_cart_speed_pwm,
             "tile_cart_distance_cm": self.tile_cart_distance_cm,
         }
 
@@ -231,7 +233,8 @@ class PlotterCalibration:
             tile_cart_url=str(payload.get("tile_cart_url") or "http://192.168.4.1"),
             tile_cart_player_1_command=str(payload.get("tile_cart_player_1_command") or "backward"),
             tile_cart_player_2_command=str(payload.get("tile_cart_player_2_command") or "forward"),
-            tile_cart_distance_cm=float(payload.get("tile_cart_distance_cm", 30.0)),
+            tile_cart_speed_pwm=int(payload.get("tile_cart_speed_pwm", 200)),
+            tile_cart_distance_cm=float(payload.get("tile_cart_distance_cm", 5.0)),
         )
 
     @classmethod

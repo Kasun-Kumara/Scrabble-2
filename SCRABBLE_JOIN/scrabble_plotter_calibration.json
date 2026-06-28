@@ -22,17 +22,17 @@
     ]
   ],
   "camera_index": 1,
-  "offset_x_mm": 165.0,
-  "offset_y_mm": 43.0,
+  "offset_x_mm": 172.0,
+  "offset_y_mm": 41.0,
   "cell_size_mm": 13.3,
   "x_steps_per_mm": 9.0,
   "y_steps_per_mm": 9.0,
-  "cart_x_mm": 73.0,
+  "cart_x_mm": 76.0,
   "cart_y_mm": 46.0,
-  "tile_cart_pitch_x_mm": 16.0,
-  "tile_cart_pitch_y_mm": 16.0,
-  "tile_rack_x_mm": 373.0,
-  "tile_rack_y_mm": 53.0,
+  "tile_cart_pitch_x_mm": 17.0,
+  "tile_cart_pitch_y_mm": 18.0,
+  "tile_rack_x_mm": 376.0,
+  "tile_rack_y_mm": 52.0,
   "tile_rack_pitch_mm": 15.0,
   "premium_layout": [
     [
@@ -211,7 +211,8 @@
   "actuator_timeout": 2.0,
   "actuator_countdown_seconds": 30,
   "tile_cart_url": "http://172.20.10.2",
-  "tile_cart_player_1_command": "backward",
-  "tile_cart_player_2_command": "forward",
-  "tile_cart_distance_cm": 8.0
+  "tile_cart_player_1_command": "forward",
+  "tile_cart_player_2_command": "backward",
+  "tile_cart_speed_pwm": 140,
+  "tile_cart_distance_cm": 35.0
 }

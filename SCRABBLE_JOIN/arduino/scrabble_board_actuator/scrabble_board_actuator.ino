@@ -1,68 +1,7 @@
 #include <Servo.h>
 #include <U8g2lib.h>
-#include <string.h>
 #include <Adafruit_NeoPixel.h>
-
-// ================= LED STRIP =================
-// 12x12 grid = 144 LEDs on pin 12.
-// Column layout (top-to-bottom direction): col 0=down, 1=up, 2=up, 3=down, 4=down, 5=up, ...
-// Pattern: down, up, up, down, down, up  (repeating every 6 columns)
-const byte LED_PIN       = 12;
-const byte LED_COLS      = 12;
-const byte LED_ROWS      = 12;
-const int  LED_COUNT     = LED_COLS * LED_ROWS;
-
-// true  = column runs top-to-bottom (first pixel = row 0)
-// false = column runs bottom-to-top (first pixel = row 11)
-// Pattern per col index 0-11: down up up down down up down up up down down up
-const bool COL_DIR[LED_COLS] = {
-  true, false, false, true, true, false,   // cols 0-5
-  true, false, false, true, true, false    // cols 6-11
-};
-
-Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-// Returns the strip index for grid position (col, row) where row 0 = top.
-int ledIndex(byte col, byte row) {
-  byte physRow = COL_DIR[col] ? row : (LED_ROWS - 1 - row);
-  return (int)col * LED_ROWS + (int)physRow;
-}
-
-void setAllLeds(uint32_t colour) {
-  for (int i = 0; i < LED_COUNT; i++) {
-    strip.setPixelColor(i, colour);
-  }
-  strip.show();
-}
-
-void clearAllLeds() {
-  strip.clear();
-  strip.show();
-}
-
-// ---- simple win animation state ----
-bool ledWinActive = false;
-unsigned long ledWinStart = 0;
-const unsigned long LED_WIN_DURATION_MS = 3000;
-
-void startLedWin() {
-  ledWinActive = true;
-  ledWinStart = millis();
-}
-
-void updateLedAnimation() {
-  if (!ledWinActive) return;
-  unsigned long elapsed = millis() - ledWinStart;
-  if (elapsed >= LED_WIN_DURATION_MS) {
-    clearAllLeds();
-    ledWinActive = false;
-    return;
-  }
-  // Alternate gold / off at ~4 Hz
-  bool on = ((elapsed / 125) % 2) == 0;
-  uint32_t colour = on ? strip.Color(255, 180, 0) : 0;
-  setAllLeds(colour);
-}
+#include <string.h>
 
 // ================= DISPLAY =================
 // Page-buffer version saves RAM on Arduino Uno/Nano.
@@ -183,6 +122,15 @@ Button btnChallenge(BUTTON_CHALLENGE);
 Button btnPrev(BUTTON_PREV);
 Button btnNext(BUTTON_NEXT);
 
+// ================= LED STRIP =================
+#define LED_PIN 12
+#define LED_ROWS 12
+#define LED_COLS 12
+#define LED_COUNT (LED_ROWS * LED_COLS)
+
+// Physical LED order is serpentine by column:
+// A1-A12, then B12-B1, then C1-C12, then D12-D1, ... up to L.
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // ================= WORDS =================
 int currentWordIndex = 0;
@@ -190,11 +138,6 @@ const byte MAX_RUNTIME_WORDS = 10;
 const byte MAX_WORD_LENGTH = 16;
 char runtimeWords[MAX_RUNTIME_WORDS][MAX_WORD_LENGTH + 1];
 byte runtimeWordCount = 0;
-int player1Score = 0;
-int player2Score = 0;
-bool challengeChoicePending = false;
-int chosenWordIndex = -1;
-char chosenWord[MAX_WORD_LENGTH + 1];
 
 // ================= STATES =================
 bool displayOn = false;
@@ -228,6 +171,87 @@ const char* currentWord() {
   return runtimeWords[currentWordIndex];
 }
 
+void clearLEDs() {
+  strip.clear();
+  strip.show();
+}
+
+int ledPixelIndex(byte row, byte col) {
+  if (row >= LED_ROWS || col >= LED_COLS) {
+    return -1;
+  }
+
+  if (col % 2 == 0) {
+    return col * LED_ROWS + row;
+  }
+  return col * LED_ROWS + (LED_ROWS - 1 - row);
+}
+
+void showLedTest() {
+  strip.clear();
+  int pixel = ledPixelIndex(0, 0);
+  if (pixel >= 0 && pixel < LED_COUNT) {
+    strip.setPixelColor(pixel, strip.Color(180, 0, 0));
+  }
+  strip.show();
+}
+
+bool parseLedCellToken(const char* token, byte* row, byte* col) {
+  if (token[0] < 'A' || token[0] > 'L') {
+    return false;
+  }
+
+  char* endPtr = NULL;
+  long parsedRow = strtol(token + 1, &endPtr, 10);
+  if (endPtr == token + 1 || *endPtr != '\0' || parsedRow < 1 || parsedRow > LED_ROWS) {
+    return false;
+  }
+
+  *col = (byte)(token[0] - 'A');
+  *row = (byte)(parsedRow - 1);
+  return true;
+}
+
+bool showLedCells(char* payload, int* litCount) {
+  strip.clear();
+  *litCount = 0;
+
+  char* tokenStart = payload;
+  for (char* cursor = payload; ; cursor++) {
+    bool atEnd = *cursor == '\0';
+    bool separator = *cursor == ',' || *cursor == ';' || *cursor == ' ' || *cursor == '\t';
+
+    if (atEnd || separator) {
+      char saved = *cursor;
+      *cursor = '\0';
+
+      if (tokenStart[0] != '\0') {
+        byte row = 0;
+        byte col = 0;
+        if (!parseLedCellToken(tokenStart, &row, &col)) {
+          strip.clear();
+          strip.show();
+          return false;
+        }
+
+        int pixel = ledPixelIndex(row, col);
+        if (pixel >= 0 && pixel < LED_COUNT) {
+          strip.setPixelColor(pixel, strip.Color(180, 0, 0));
+          (*litCount)++;
+        }
+      }
+
+      if (atEnd) {
+        break;
+      }
+      *cursor = saved;
+      tokenStart = cursor + 1;
+    }
+  }
+
+  strip.show();
+  return true;
+}
 
 bool copyCleanWord(char* destination, const char* word) {
   byte outputIndex = 0;
@@ -316,6 +340,7 @@ void resetPlayState() {
   inChallengeMode = false;
   wordChosen = false;
   showCountdown = false;
+  clearLEDs();
 }
 
 void raiseBoard() {
@@ -347,6 +372,7 @@ void startCountdown(unsigned int seconds) {
   countdownDurationMs = (unsigned long)seconds * 1000UL;
   inChallengeMode = false;
   wordChosen = false;
+  clearLEDs();
 }
 
 void stopCountdown() {
@@ -358,12 +384,14 @@ void startChallengeMode() {
   inChallengeMode = true;
   wordChosen = false;
   showCountdown = false;
+  clearLEDs();
 }
 
 void cancelChallengeMode() {
   inChallengeMode = false;
   wordChosen = false;
   showCountdown = false;
+  clearLEDs();
 }
 
 void previousWord() {
@@ -493,32 +521,6 @@ void printStatus() {
   Serial.println(currentWord());
 }
 
-bool parseScoreCommand(char* text) {
-  int p1 = player1Score;
-  int p2 = player2Score;
-  char* token = strtok(text, " \t");
-  while (token != NULL) {
-    if (strcmp(token, "P1") == 0) {
-      char* value = strtok(NULL, " \t");
-      if (value == NULL) {
-        break;
-      }
-      p1 = atoi(value);
-    } else if (strcmp(token, "P2") == 0) {
-      char* value = strtok(NULL, " \t");
-      if (value == NULL) {
-        break;
-      }
-      p2 = atoi(value);
-    }
-    token = strtok(NULL, " \t");
-  }
-  player1Score = max(0, p1);
-  player2Score = max(0, p2);
-  displayOn = true;
-  return true;
-}
-
 void handleSerialCommand(char* rawCommand) {
   char* cmd = trimWhitespace(rawCommand);
   uppercaseAscii(cmd);
@@ -563,6 +565,7 @@ void handleSerialCommand(char* rawCommand) {
     Serial.println(F("ok challenge cancel"));
   } else if (strcmp(cmd, "WORD_CLEAR") == 0) {
     clearRuntimeWords();
+    clearLEDs();
     Serial.println(F("ok word clear"));
   } else if (commandStartsWith(cmd, "WORD_LIST")) {
     char* wordsText = trimWhitespace(cmd + strlen("WORD_LIST"));
@@ -600,16 +603,21 @@ void handleSerialCommand(char* rawCommand) {
     chooseCurrentWord();
     Serial.print(F("ok word choose "));
     Serial.println(currentWord());
-  } else if (commandStartsWith(cmd, "SCORE")) {
-    char* scoreText = trimWhitespace(cmd + strlen("SCORE"));
-    if (!parseScoreCommand(scoreText)) {
-      Serial.println(F("err invalid score"));
+  } else if (strcmp(cmd, "LED_CLEAR") == 0) {
+    clearLEDs();
+    Serial.println(F("ok led clear"));
+  } else if (strcmp(cmd, "LED_TEST") == 0) {
+    showLedTest();
+    Serial.println(F("ok led test A1"));
+  } else if (commandStartsWith(cmd, "LED_CELLS")) {
+    char* payload = trimWhitespace(cmd + strlen("LED_CELLS"));
+    int litCount = 0;
+    if (!showLedCells(payload, &litCount)) {
+      Serial.println(F("err invalid led cells"));
       return;
     }
-    Serial.print(F("ok score p1 "));
-    Serial.print(player1Score);
-    Serial.print(F(" p2 "));
-    Serial.println(player2Score);
+    Serial.print(F("ok led cells "));
+    Serial.println(litCount);
   } else if (strcmp(cmd, "DISPLAY_ON") == 0) {
     displayOn = true;
     Serial.println(F("ok display on"));
@@ -619,17 +627,6 @@ void handleSerialCommand(char* rawCommand) {
   } else if (strcmp(cmd, "STATUS") == 0) {
     printStatus();
     Serial.println(F("ok status"));
-  } else if (strcmp(cmd, "LED_RED") == 0) {
-    ledWinActive = false;
-    setAllLeds(strip.Color(255, 0, 0));
-    Serial.println(F("ok led red"));
-  } else if (strcmp(cmd, "LED_OFF") == 0) {
-    ledWinActive = false;
-    clearAllLeds();
-    Serial.println(F("ok led off"));
-  } else if (strcmp(cmd, "LED_WIN") == 0) {
-    startLedWin();
-    Serial.println(F("ok led win"));
   } else {
     Serial.print(F("err unknown command "));
     Serial.println(cmd);
@@ -673,11 +670,6 @@ void drawDisplayContent() {
     u8g2.print(remaining);
     u8g2.print(F("s"));
   } else if (wordChosen) {
-    u8g2.setCursor(0, 10);
-    u8g2.print(F("P1:"));
-    u8g2.print(player1Score);
-    u8g2.print(F("  P2:"));
-    u8g2.print(player2Score);
     u8g2.setCursor(0, 20);
     u8g2.print(F("Chosen Word:"));
     u8g2.setCursor(0, 40);
@@ -687,15 +679,10 @@ void drawDisplayContent() {
       u8g2.print(F("No camera words"));
     }
   } else if (inChallengeMode) {
-    u8g2.setCursor(0, 10);
-    u8g2.print(F("P1:"));
-    u8g2.print(player1Score);
-    u8g2.print(F("  P2:"));
-    u8g2.print(player2Score);
-    u8g2.setCursor(0, 24);
+    u8g2.setCursor(0, 20);
     u8g2.print(F("Challenge Mode"));
     if (activeWordCount() > 0) {
-      u8g2.setCursor(0, 42);
+      u8g2.setCursor(0, 40);
       u8g2.print(F("Choose word:"));
       u8g2.setCursor(0, 60);
       u8g2.print(currentWord());
@@ -706,12 +693,7 @@ void drawDisplayContent() {
       u8g2.print(F("then challenge"));
     }
   } else {
-    u8g2.setCursor(0, 20);
-    u8g2.print(F("P1:"));
-    u8g2.print(player1Score);
-    u8g2.print(F("  P2:"));
-    u8g2.print(player2Score);
-    u8g2.setCursor(30, 44);
+    u8g2.setCursor(30, 32);
     u8g2.print(F("SCRABLIFY"));
   }
 }
@@ -740,9 +722,7 @@ void setup() {
   u8g2.begin();
 
   strip.begin();
-  strip.setBrightness(180);
-  strip.clear();
-  strip.show();
+  clearLEDs();
 
   actuatorServo.attach(SERVO_PIN);
   writeActuator(SERVO_MIN_ANGLE);
@@ -757,6 +737,5 @@ void loop() {
   updateServoSystem();
   updateButtons();
   updateTimedStates();
-  updateLedAnimation();
   updateDisplay();
 }

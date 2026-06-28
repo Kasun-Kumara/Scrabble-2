@@ -177,6 +177,14 @@ class PlotterCalibrationTests(unittest.TestCase):
         self.assertEqual(loaded.tile_cart_player_2_command, "forward")
         self.assertEqual(len(loaded.image_corners), 4)
 
+    def test_tile_cart_motion_defaults_round_trip(self) -> None:
+        calibration = PlotterCalibration()
+
+        loaded = PlotterCalibration.from_dict(calibration.to_dict())
+
+        self.assertEqual(loaded.tile_cart_speed_pwm, 200)
+        self.assertEqual(loaded.tile_cart_distance_cm, 5.0)
+
     def test_persistence_round_trip_includes_step_settings(self) -> None:
         calibration = PlotterCalibration(
             x_steps_per_mm=100.0,
@@ -1382,6 +1390,18 @@ class SerialSenderTests(unittest.TestCase):
         self.assertEqual(connection.writes, ["WORD_CLEAR\n"])
         self.assertEqual(responses, ["ok word clear"])
 
+    def test_board_actuator_sender_formats_light_cell_commands(self) -> None:
+        connection = _FakeSerialConnection(["ok led cells 2\n", "ok led clear\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        light_responses = sender.light_cells(["a1", "b2"])
+        clear_responses = sender.clear_lights()
+
+        self.assertEqual(connection.writes, ["LED_CELLS A1,B2\n", "LED_CLEAR\n"])
+        self.assertEqual(light_responses, ["ok led cells 2"])
+        self.assertEqual(clear_responses, ["ok led clear"])
+
 
     def test_board_actuator_sender_formats_score_command(self) -> None:
         connection = _FakeSerialConnection(["ok score p1 12 p2 8\n"])
@@ -1399,17 +1419,39 @@ class GameStateTests(unittest.TestCase):
     def test_tile_cart_url_for_command_adds_http_and_route(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
         app.tile_cart_url_var = _FakeVar("192.168.4.1")
+        app.tile_cart_speed_pwm_var = _FakeVar("200")
+        app.tile_cart_distance_cm_var = _FakeVar("5")
 
         url = ScrabblePlotterApp._tile_cart_url_for_command(app, "forward")
 
-        self.assertEqual(url, "http://192.168.4.1/forward")
+        self.assertEqual(url, "http://192.168.4.1/forward?speed=200&distance=5.0")
 
     def test_tile_cart_rejects_unknown_command(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
         app.tile_cart_url_var = _FakeVar("http://192.168.4.1")
+        app.tile_cart_speed_pwm_var = _FakeVar("200")
+        app.tile_cart_distance_cm_var = _FakeVar("5")
 
         with self.assertRaisesRegex(ValueError, "forward, backward, or stop"):
             ScrabblePlotterApp._tile_cart_url_for_command(app, "left")
+
+    def test_tile_cart_move_rejects_zero_speed(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_cart_url_var = _FakeVar("http://192.168.4.1")
+        app.tile_cart_speed_pwm_var = _FakeVar("0")
+        app.tile_cart_distance_cm_var = _FakeVar("5")
+
+        with self.assertRaisesRegex(ValueError, "between 1 and 255"):
+            ScrabblePlotterApp._tile_cart_url_for_command(app, "forward")
+
+    def test_tile_cart_timeout_covers_expected_motor_movement(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_cart_speed_pwm_var = _FakeVar("35")
+        app.tile_cart_distance_cm_var = _FakeVar("10")
+
+        timeout = ScrabblePlotterApp._tile_cart_request_timeout(app, "forward")
+
+        self.assertAlmostEqual(timeout, 6.3)
 
     def _game_app(self):
         app = object.__new__(ScrabblePlotterApp)
@@ -1553,6 +1595,48 @@ class AiPlayerGuiTests(unittest.TestCase):
 
         ScrabblePlotterApp._start_turn(app)
 
+        self.assertEqual(app.scheduled, [])
+
+    def test_turn_waits_for_tile_cart_before_timer_and_ai_start(self) -> None:
+        app = self._turn_app(player=1)
+        app._timer_running = False
+        app._timer_display_var = _FakeVar("Time Remaining: 2:00")
+        app.tile_cart_enabled_var = _FakeVar(True)
+        app._tile_cart_player_position = 2
+        app._pending_turn_cart_player = None
+        app.statuses = []
+        app.logs = []
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+        app.cart_moves = []
+        app._start_cart_movement_countdown = lambda: app.cart_moves.append(app._current_player)
+
+        ScrabblePlotterApp._start_turn(app)
+
+        self.assertFalse(app._timer_running)
+        self.assertEqual(app.scheduled, [])
+        self.assertEqual(app.cart_moves, [1])
+        self.assertEqual(app._pending_turn_cart_player, 1)
+        self.assertEqual(app._timer_display_var.get(), "Waiting for tile cart...")
+
+        app._tile_cart_player_position = 1
+        ScrabblePlotterApp._resume_pending_turn_after_cart_arrival(app, 1)
+
+        self.assertTrue(app._timer_running)
+        self.assertIsNone(app._pending_turn_cart_player)
+        self.assertEqual(app.scheduled[0][0], 200)
+        self.assertEqual(app.scheduled[1][0], 700)
+        self.assertIn("Rack filling can start", app.statuses[-1])
+
+    def test_cart_arrival_for_another_player_does_not_release_turn(self) -> None:
+        app = self._turn_app(player=2)
+        app._timer_running = False
+        app._pending_turn_cart_player = 2
+
+        ScrabblePlotterApp._resume_pending_turn_after_cart_arrival(app, 1)
+
+        self.assertFalse(app._timer_running)
+        self.assertEqual(app._pending_turn_cart_player, 2)
         self.assertEqual(app.scheduled, [])
 
     def test_ai_pick_drop_steps_use_each_rack_slot_and_square_in_order(self) -> None:
@@ -1828,7 +1912,7 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         self.assertEqual(app.statuses[-1], "Sent actuator command: CHALLENGE_START")
 
-    def test_start_challenge_sends_camera_words_challenge_then_letter_lights(self) -> None:
+    def test_start_challenge_sends_all_words_and_light_grid_commands(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
         app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
         app._letter_vars[9][2].set("C")
@@ -1851,11 +1935,47 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         ScrabblePlotterApp.start_actuator_challenge(app)
 
-        labels = ScrabblePlotterApp._current_led_cell_labels(app)
         self.assertEqual(app.errors, [])
-        self.assertEqual(labels, ["C10", "D10"])
+        self.assertEqual(
+            app.commands,
+            [
+                "WORD_CLEAR",
+                "WORD_LIST CD",
+                "WORD_CELLS 0 C10,D10",
+                "CHALLENGE_START",
+                "LED_CELLS C10,D10",
+            ],
+        )
 
-    def test_start_challenge_does_not_send_blank_letter_lights(self) -> None:
+    def test_challenge_setup_maps_every_display_word_to_its_lights(self) -> None:
+        candidates = [
+            ChallengeCandidate("CAT", ("A1", "B1", "C1"), 5, 1),
+            ChallengeCandidate("DOG", ("D2", "D3", "D4"), 5, 2),
+        ]
+
+        commands = ScrabblePlotterApp._challenge_setup_commands(candidates)
+
+        self.assertEqual(
+            commands,
+            [
+                "WORD_CLEAR",
+                "WORD_LIST CAT,DOG",
+                "WORD_CELLS 0 A1,B1,C1",
+                "WORD_CELLS 1 D2,D3,D4",
+            ],
+        )
+
+    def test_challenge_button_choice_response_is_parsed(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+
+        choice = ScrabblePlotterApp._challenge_choice_from_responses(
+            app,
+            ["ok challenge chosen 1 DOG"],
+        )
+
+        self.assertEqual(choice, (1, "DOG"))
+
+    def test_start_challenge_rejects_board_without_words(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
         app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
         app._last_camera_letter_scan = None
@@ -1872,7 +1992,7 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         self.assertEqual(app.commands, [])
         self.assertEqual(len(app.errors), 1)
-        self.assertIn("No board letters", str(app.errors[0]))
+        self.assertIn("No board words", str(app.errors[0]))
 
     def test_pending_challenge_uses_fresh_camera_word_scan_grid(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
@@ -1912,10 +2032,18 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         ScrabblePlotterApp._handle_camera_word_scan_result(app, scan, announce=False, scan_token=4)
 
-        labels = ScrabblePlotterApp._current_led_cell_labels(app)
         self.assertFalse(app._pending_actuator_challenge_after_word_scan)
         self.assertEqual(app.errors, [])
-        self.assertEqual(labels, ["C10", "D10", "E10"])
+        self.assertEqual(
+            app.commands,
+            [
+                "WORD_CLEAR",
+                "WORD_LIST CAT",
+                "WORD_CELLS 0 C10,D10,E10",
+                "CHALLENGE_START",
+                "LED_CELLS C10,D10,E10",
+            ],
+        )
 
 
 
@@ -1933,7 +2061,80 @@ class BoardActuatorGuiTests(unittest.TestCase):
         self.assertEqual(app.commands, ["WORD_CHOOSE"])
         self.assertEqual(app.errors, [])
 
-    def test_challenge_choice_valid_word_awards_owner_and_lights_word(self) -> None:
+    def test_light_test_controls_send_direct_light_commands(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app._send_actuator_button_command = app.commands.append
+
+        ScrabblePlotterApp.actuator_light_test(app)
+        ScrabblePlotterApp.actuator_lights_off(app)
+
+        self.assertEqual(app.commands, ["LED_TEST", "LED_CLEAR"])
+
+    def test_light_letters_sends_manually_entered_squares(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_light_squares_var = _FakeVar("a1, B2; A1")
+        app.actuator_word_var = _FakeVar("")
+        app.commands = []
+        app.statuses = []
+        app.errors = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok led cells 2"]
+        app._set_status = app.statuses.append
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.actuator_light_letters(app)
+
+        self.assertEqual(app.errors, [])
+        self.assertEqual(app.commands, ["LED_CELLS A1,B2"])
+        self.assertIn("Lit 2", app.statuses[-1])
+
+    def test_light_letters_uses_word_squares_when_manual_squares_are_empty(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_light_squares_var = _FakeVar("")
+        app.actuator_word_var = _FakeVar("dog")
+        app._build_challenge_candidates = lambda limit=10: [
+            ChallengeCandidate("CAT", ("A1", "B1", "C1"), 5, 1),
+            ChallengeCandidate("DOG", ("D2", "D3", "D4"), 5, 2),
+        ]
+        app.commands = []
+        app.statuses = []
+        app.errors = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok led cells 3"]
+        app._set_status = app.statuses.append
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.actuator_light_letters(app)
+
+        self.assertEqual(app.errors, [])
+        self.assertEqual(app.commands, ["LED_CELLS D2,D3,D4"])
+        self.assertIn("DOG", app.statuses[-1])
+
+    def test_gui_next_and_previous_word_update_lit_squares(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._challenge_candidates = [
+            ChallengeCandidate("CAT", ("A1", "B1", "C1"), 5, 1),
+            ChallengeCandidate("DOG", ("D2", "D3", "D4"), 5, 2),
+        ]
+        app._challenge_candidate_index = 0
+        app.commands = []
+        app.statuses = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+
+        ScrabblePlotterApp.next_actuator_word(app)
+        ScrabblePlotterApp.previous_actuator_word(app)
+
+        self.assertEqual(
+            app.commands,
+            [
+                "WORD_NEXT",
+                "LED_CELLS D2,D3,D4",
+                "WORD_PREV",
+                "LED_CELLS A1,B1,C1",
+            ],
+        )
+
+    def test_challenge_choice_valid_word_awards_owner(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
         app._challenge_candidates = [ChallengeCandidate("CAT", ("A1", "B1", "C1"), 5, 1)]
         app._current_player = 2
@@ -1954,6 +2155,7 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         self.assertEqual(app._player_1_score, 5)
         self.assertEqual(app._player_2_score, 0)
+        self.assertEqual(app.commands, ["SCORE P1 5 P2 0"])
         self.assertIn("valid", app.statuses[-1])
 
     def test_challenge_choice_invalid_word_awards_challenger(self) -> None:
@@ -1998,8 +2200,6 @@ class BoardActuatorGuiTests(unittest.TestCase):
         app._set_status = app.statuses.append
         app._refresh_camera_preview = lambda: None
         app._log = app.logs.append
-        app._try_send_letter_leds_to_actuator = lambda *args, **kwargs: None
-
         scan = CameraLetterScanResult(letters=[], grid=None)
 
         ScrabblePlotterApp._handle_camera_letter_scan_result(app, scan, announce=True, scan_token=7)
