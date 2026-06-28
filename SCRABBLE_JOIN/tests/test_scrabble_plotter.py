@@ -1597,13 +1597,12 @@ class AiPlayerGuiTests(unittest.TestCase):
 
         self.assertEqual(app.scheduled, [])
 
-    def test_turn_waits_for_tile_cart_before_timer_and_ai_start(self) -> None:
+    def test_turn_starts_while_tile_cart_moves_in_background(self) -> None:
         app = self._turn_app(player=1)
         app._timer_running = False
         app._timer_display_var = _FakeVar("Time Remaining: 2:00")
         app.tile_cart_enabled_var = _FakeVar(True)
         app._tile_cart_player_position = 2
-        app._pending_turn_cart_player = None
         app.statuses = []
         app.logs = []
         app._set_status = app.statuses.append
@@ -1613,31 +1612,12 @@ class AiPlayerGuiTests(unittest.TestCase):
 
         ScrabblePlotterApp._start_turn(app)
 
-        self.assertFalse(app._timer_running)
-        self.assertEqual(app.scheduled, [])
-        self.assertEqual(app.cart_moves, [1])
-        self.assertEqual(app._pending_turn_cart_player, 1)
-        self.assertEqual(app._timer_display_var.get(), "Waiting for tile cart...")
-
-        app._tile_cart_player_position = 1
-        ScrabblePlotterApp._resume_pending_turn_after_cart_arrival(app, 1)
-
         self.assertTrue(app._timer_running)
-        self.assertIsNone(app._pending_turn_cart_player)
-        self.assertEqual(app.scheduled[0][0], 200)
-        self.assertEqual(app.scheduled[1][0], 700)
-        self.assertIn("Rack filling can start", app.statuses[-1])
-
-    def test_cart_arrival_for_another_player_does_not_release_turn(self) -> None:
-        app = self._turn_app(player=2)
-        app._timer_running = False
-        app._pending_turn_cart_player = 2
-
-        ScrabblePlotterApp._resume_pending_turn_after_cart_arrival(app, 1)
-
-        self.assertFalse(app._timer_running)
-        self.assertEqual(app._pending_turn_cart_player, 2)
-        self.assertEqual(app.scheduled, [])
+        self.assertEqual([delay for delay, _callback in app.scheduled], [200, 700])
+        self.assertEqual(app.cart_moves, [1])
+        self.assertEqual(app._current_player_display_var.get(), "Current Player: 1")
+        self.assertTrue(app._timer_display_var.get().startswith("Time Remaining:"))
+        self.assertIn("moving the tile cart in the background", app.statuses[-1])
 
     def test_ai_pick_drop_steps_use_each_rack_slot_and_square_in_order(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
@@ -1974,6 +1954,35 @@ class BoardActuatorGuiTests(unittest.TestCase):
         )
 
         self.assertEqual(choice, (1, "DOG"))
+
+    def test_timer_button_response_is_parsed(self) -> None:
+        self.assertTrue(
+            ScrabblePlotterApp._timer_button_pressed_from_responses(["ok timer pressed"])
+        )
+        self.assertFalse(
+            ScrabblePlotterApp._timer_button_pressed_from_responses(["ok timer none"])
+        )
+
+    def test_timer_button_ends_the_active_turn(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._game_started = True
+        app._timer_running = True
+        app._turn_scanning = False
+        app._current_player = 2
+        app._current_player_display_var = _FakeVar("Current Player: 2")
+        app.logs = []
+        app.ended_turns = 0
+        app._log = app.logs.append
+
+        def end_turn() -> None:
+            app.ended_turns += 1
+
+        app._end_turn = end_turn
+
+        ScrabblePlotterApp._handle_timer_button_press(app)
+
+        self.assertEqual(app.ended_turns, 1)
+        self.assertIn("Player 2 pressed the timer button", app.logs[-1])
 
     def test_start_challenge_rejects_board_without_words(self) -> None:
         app = object.__new__(ScrabblePlotterApp)

@@ -37,7 +37,7 @@ python -m scrabble_plotter gui
 - Calibrate the board corners from the camera.
 - Take a still picture, capture letters, and detect horizontal or vertical words.
 - Fill the 12x12 board matrix and calculate the board score.
-- Move the tile cart to the active player and wait for confirmed arrival before rack filling and the turn timer begin.
+- Start each turn and its timer immediately while the tile cart moves to the active player in the background.
 - Preview and send plotter moves to board squares from A1 to L12.
 - Send stepper scale settings, move to the cart position, or reset the controller.
 

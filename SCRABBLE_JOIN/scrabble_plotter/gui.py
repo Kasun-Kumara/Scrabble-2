@@ -83,6 +83,7 @@ PICK_DROP_MAGNET_DELAY_MS = 1000
 PICK_DROP_MOVE_DELAY_MS = 1000
 PICK_DROP_Z_SETTLE_DELAY_MS = 1000
 CHALLENGE_POLL_INTERVAL_MS = 500
+TIMER_BUTTON_POLL_INTERVAL_MS = 250
 TILE_CART_CALIBRATION_PWM = 35.0
 TILE_CART_SECONDS_PER_CM_AT_CALIBRATION_PWM = 0.130
 TILE_CART_HTTP_OVERHEAD_SECONDS = 5.0
@@ -188,6 +189,8 @@ class ScrabblePlotterApp:
         self._challenge_candidate_index = 0
         self._challenge_poll_after_id: str | None = None
         self._challenge_polling = False
+        self._timer_button_poll_after_id: str | None = None
+        self._timer_button_polling = False
         self.camera_words_text: tk.Text | None = None
 
         self._current_player = 1
@@ -214,7 +217,6 @@ class ScrabblePlotterApp:
         self._turn_scan_detected_words: list[str] = []
         self._tile_cart_player_position: int | None = None
         self._tile_cart_move_running = False
-        self._pending_turn_cart_player: int | None = None
 
         self.status_var = tk.StringVar(
             value="Start the camera to find visible words."
@@ -5402,6 +5404,84 @@ class ScrabblePlotterApp:
                 return index, normalize_word(parts[1])
         return None
 
+    @staticmethod
+    def _timer_button_pressed_from_responses(responses: list[str]) -> bool:
+        return any(response.strip().lower() == "ok timer pressed" for response in responses)
+
+    def _start_timer_button_polling(self) -> None:
+        if self._has_inline_actuator_test_double():
+            return
+        actuator_port_var = getattr(self, "actuator_port_var", None)
+        if actuator_port_var is None or not actuator_port_var.get().strip():
+            return
+        self._timer_button_polling = True
+        self._schedule_timer_button_poll()
+
+    def _schedule_timer_button_poll(self) -> None:
+        if not getattr(self, "_timer_button_polling", False):
+            return
+        if getattr(self, "_timer_button_poll_after_id", None):
+            return
+        self._timer_button_poll_after_id = self.root.after(
+            TIMER_BUTTON_POLL_INTERVAL_MS,
+            self._poll_timer_button,
+        )
+
+    def _stop_timer_button_polling(self) -> None:
+        self._timer_button_polling = False
+        after_id = getattr(self, "_timer_button_poll_after_id", None)
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._timer_button_poll_after_id = None
+
+    def _poll_timer_button(self) -> None:
+        self._timer_button_poll_after_id = None
+        if not getattr(self, "_timer_button_polling", False):
+            return
+        try:
+            config = self._actuator_config()
+        except Exception as exc:
+            self._stop_timer_button_polling()
+            self._log(f"Timer button polling stopped: {exc}")
+            return
+
+        def worker() -> None:
+            try:
+                with self._serial_lock:
+                    sender = self._get_actuator_sender_for_config(config)
+                    responses = sender.send_command("TIMER_TAKE")
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc: self._timer_button_poll_failed(exc))
+                return
+            self.root.after(0, lambda responses=responses: self._timer_button_poll_complete(responses))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _timer_button_poll_complete(self, responses: list[str]) -> None:
+        if any("unknown command timer_take" in response.lower() for response in responses):
+            self._stop_timer_button_polling()
+            self._log("Timer button polling needs the updated board actuator Arduino sketch.")
+            return
+        if self._timer_button_pressed_from_responses(responses):
+            self._handle_timer_button_press()
+        self._schedule_timer_button_poll()
+
+    def _timer_button_poll_failed(self, exc: Exception) -> None:
+        self._log(f"Timer button polling paused: {exc}")
+        self._schedule_timer_button_poll()
+
+    def _handle_timer_button_press(self) -> None:
+        if not getattr(self, "_game_started", False):
+            return
+        if not getattr(self, "_timer_running", False) or getattr(self, "_turn_scanning", False):
+            return
+        player_id = self._current_player_id()
+        self._log(f"Player {player_id} pressed the timer button; ending the turn.")
+        self._end_turn()
+
     def _handle_challenge_choice(self, index: int, word: str) -> None:
         candidate = self._challenge_candidate_for_choice(index, word)
         if candidate is None:
@@ -5559,6 +5639,7 @@ class ScrabblePlotterApp:
         self._log(f"Live website feed ready at {address}/api/match")
 
     def _on_close(self) -> None:
+        self._stop_timer_button_polling()
         self.stop_camera(clear_preview=False)
         try:
             self._send_shutdown_board_down()
@@ -5829,6 +5910,7 @@ class ScrabblePlotterApp:
         self._turn_scan_detected_words.clear()
         self._update_grid_colors()
         self._send_scores_to_actuator(announce=False)
+        self._start_timer_button_polling()
         self._start_turn()
 
     def _start_turn(self) -> None:
@@ -5837,33 +5919,14 @@ class ScrabblePlotterApp:
         player_id = self._current_player_id()
         self._current_player = player_id
 
-        if self._tile_cart_enabled() and self._tile_cart_player_position != player_id:
-            self._pending_turn_cart_player = player_id
-            self._pause_turn_until_cart_arrives(player_id)
+        move_tile_cart = self._tile_cart_enabled() and self._tile_cart_player_position != player_id
+        self._begin_turn(player_id)
+        if move_tile_cart:
+            self._set_status(f"Player {player_id}'s turn started; moving the tile cart in the background.")
+            self._log(f"Player {player_id}'s turn started while the tile cart moves into position.")
             self._start_cart_movement_countdown()
-            return
 
-        self._pending_turn_cart_player = None
-        self._begin_turn_after_cart_arrival(player_id)
-
-    def _pause_turn_until_cart_arrives(self, player_id: int) -> None:
-        self._timer_running = False
-        timer_after_id = getattr(self, "_timer_after_id", None)
-        if timer_after_id:
-            try:
-                self.root.after_cancel(timer_after_id)
-            except Exception:
-                pass
-            self._timer_after_id = None
-
-        self._current_player_display_var.set(f"Current Player: {player_id} (Waiting for tile cart)")
-        timer_display_var = getattr(self, "_timer_display_var", None)
-        if timer_display_var is not None:
-            timer_display_var.set("Waiting for tile cart...")
-        self._set_status(f"Moving tile cart to Player {player_id} before rack filling starts...")
-        self._log(f"Player {player_id} is waiting for the tile cart before filling the rack.")
-
-    def _begin_turn_after_cart_arrival(self, player_id: int) -> None:
+    def _begin_turn(self, player_id: int) -> None:
         if self._current_player_id() != player_id:
             return
         self._current_player_display_var.set(f"Current Player: {player_id}")
@@ -5872,18 +5935,7 @@ class ScrabblePlotterApp:
         if not self._timer_running:
             self._timer_running = True
             self._update_timer()
-        if self._tile_cart_enabled():
-            self._set_status(f"Tile cart is ready for Player {player_id}. Rack filling can start.")
-            self._log(f"Tile cart arrived for Player {player_id}; rack filling is now enabled.")
         self._schedule_ai_player_if_needed()
-
-    def _resume_pending_turn_after_cart_arrival(self, player_id: int) -> None:
-        if getattr(self, "_pending_turn_cart_player", None) != player_id:
-            return
-        if self._current_player_id() != player_id:
-            return
-        self._pending_turn_cart_player = None
-        self._begin_turn_after_cart_arrival(player_id)
 
     def _schedule_ai_player_if_needed(self) -> None:
         if not self._should_auto_run_ai_player():
@@ -5932,7 +5984,6 @@ class ScrabblePlotterApp:
             return
         player_id = self._current_player_id()
         if self._tile_cart_player_position == player_id:
-            self._resume_pending_turn_after_cart_arrival(player_id)
             return
 
         if getattr(self, "_cart_countdown_after_id", None):
@@ -5991,12 +6042,14 @@ class ScrabblePlotterApp:
             if player_id in (1, 2):
                 self._tile_cart_player_position = player_id
                 self._set_status(f"Tile cart moved for Player {player_id}.")
-                self._resume_pending_turn_after_cart_arrival(player_id)
             else:
                 self._set_status(f"Tile cart command sent: {command}.")
             self._log(f"Tile cart {command}: {message or 'ok'}")
-            pending_player = getattr(self, "_pending_turn_cart_player", None)
-            if pending_player in (1, 2) and self._current_player_id() == pending_player:
+            if (
+                player_id in (1, 2)
+                and self._tile_cart_enabled()
+                and self._tile_cart_player_position != self._current_player_id()
+            ):
                 self._move_tile_cart_for_current_player()
 
         def on_error(exc: Exception) -> None:

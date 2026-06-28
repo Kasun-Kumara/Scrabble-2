@@ -144,6 +144,7 @@ bool displayOn = false;
 bool inChallengeMode = false;
 bool wordChosen = false;
 bool showCountdown = false;
+bool timerButtonPressed = false;
 
 unsigned long countdownStart = 0;
 unsigned long countdownDurationMs = 30000;
@@ -435,8 +436,9 @@ void updateButtons() {
     toggleBoard();
   }
 
-  if (btnCountdown.pressed() && displayOn) {
-    startCountdown((unsigned int)(countdownDurationMs / 1000UL));
+  if (btnCountdown.pressed()) {
+    timerButtonPressed = true;
+    stopCountdown();
   }
 
   if (btnChallenge.pressed() && displayOn) {
@@ -557,6 +559,13 @@ void handleSerialCommand(char* rawCommand) {
   } else if (strcmp(cmd, "COUNTDOWN_STOP") == 0) {
     stopCountdown();
     Serial.println(F("ok countdown stop"));
+  } else if (strcmp(cmd, "TIMER_TAKE") == 0) {
+    if (timerButtonPressed) {
+      timerButtonPressed = false;
+      Serial.println(F("ok timer pressed"));
+    } else {
+      Serial.println(F("ok timer none"));
+    }
   } else if (strcmp(cmd, "CHALLENGE_START") == 0) {
     startChallengeMode();
     Serial.println(F("ok challenge start"));

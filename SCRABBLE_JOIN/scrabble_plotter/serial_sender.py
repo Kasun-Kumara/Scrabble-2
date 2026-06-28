@@ -202,3 +202,6 @@ class BoardActuatorSender(GCodeSender):
     def take_challenge_choice(self) -> list[str]:
         return self.send_command("CHALLENGE_TAKE")
 
+    def take_timer_button_press(self) -> list[str]:
+        return self.send_command("TIMER_TAKE")
+
