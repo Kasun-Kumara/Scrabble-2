@@ -104,7 +104,6 @@ class ScrabblePlotterApp:
         self.root.title("Scrabble Join")
         self.root.geometry("1240x820")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(800, self._send_startup_board_up)
         self.root.after(900, self._install_tile_rack_calibrate_button)
         self.root.after(1000, self._install_tile_rack_letters_panel)
         self.root.after(1050, self._install_live_board_calibrate_button)
@@ -196,6 +195,7 @@ class ScrabblePlotterApp:
         self._current_player = 1
         self._turn_end_time = 0.0
         self._timer_after_id: str | None = None
+        self._last_actuator_timer_second: int | None = None
         self._player_1_cells: set[str] = set()
         self._player_2_cells: set[str] = set()
         self._previous_board_state: dict[str, str] = {}
@@ -444,7 +444,14 @@ class ScrabblePlotterApp:
             row=next_move_row + 5, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
 
-        self._build_board_actuator_controls(controls, row=2)
+        actuator_box = ttk.LabelFrame(controls, text="Board Actuator", padding=10)
+        actuator_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        actuator_box.columnconfigure(0, weight=1)
+        ttk.Button(
+            actuator_box,
+            text="Light Grid Animation",
+            command=self.actuator_light_test,
+        ).grid(row=0, column=0, sticky="ew")
 
         scan_box = ttk.LabelFrame(controls, text="Camera OCR", padding=10)
         scan_box.grid(row=3, column=0, sticky="ew", pady=(12, 0))
@@ -642,71 +649,6 @@ class ScrabblePlotterApp:
         ttk.Label(log_box, textvariable=self.status_var, wraplength=380).grid(row=0, column=0, sticky="ew")
         self.log_text = tk.Text(log_box, height=14, wrap="word")
         self.log_text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-
-    def _build_board_actuator_controls(self, parent: ttk.Frame, row: int) -> None:
-        actuator_box = ttk.LabelFrame(parent, text="Board Actuator Arduino", padding=10)
-        actuator_box.grid(row=row, column=0, sticky="ew", pady=(12, 0))
-        actuator_box.columnconfigure(1, weight=1)
-
-        ttk.Label(actuator_box, text="COM Port").grid(row=0, column=0, sticky="w", pady=2)
-        self.actuator_port_combo = ttk.Combobox(
-            actuator_box,
-            textvariable=self.actuator_port_var,
-            values=[],
-            width=12,
-        )
-        self.actuator_port_combo.grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=2)
-        ttk.Button(actuator_box, text="Refresh", command=self.refresh_ports).grid(
-            row=0, column=2, sticky="ew", pady=2
-        )
-
-        fields = [
-            ("Baud", self.actuator_baud_var),
-            ("Timeout", self.actuator_timeout_var),
-            ("Countdown s", self.actuator_countdown_seconds_var),
-            ("Word", self.actuator_word_var),
-            ("Letter squares", self.actuator_light_squares_var),
-        ]
-        for index, (label, variable) in enumerate(fields, start=1):
-            ttk.Label(actuator_box, text=label).grid(row=index, column=0, sticky="w", pady=2)
-            ttk.Entry(actuator_box, textvariable=variable).grid(
-                row=index, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=2
-            )
-
-        buttons = [
-            ("Save", self.save_actuator_settings),
-            ("Test", self.test_actuator_connection),
-            ("Status", self.request_actuator_status),
-            ("Board Up", self.actuator_board_up),
-            ("Board Down", self.actuator_board_down),
-            ("Countdown", self.start_actuator_countdown),
-            ("Stop Timer", self.stop_actuator_countdown),
-            ("Challenge", self.start_actuator_challenge),
-            ("Cancel Chal.", self.cancel_actuator_challenge),
-            ("Prev Word", self.previous_actuator_word),
-            ("Next Word", self.next_actuator_word),
-            ("Send Word", self.send_actuator_word),
-            ("Camera Words", self.send_camera_words_to_actuator),
-            ("Send Scores", self.send_scores_to_actuator),
-            ("Reveal Word", self.reveal_actuator_word),
-            ("Display On", self.actuator_display_on),
-            ("Display Off", self.actuator_display_off),
-            ("Light Letters", self.actuator_light_letters),
-            ("Light Test", self.actuator_light_test),
-            ("Lights Off", self.actuator_lights_off),
-        ]
-        button_start_row = len(fields) + 1
-        for index, (label, command) in enumerate(buttons):
-            button_row = button_start_row + index // 3
-            button_col = index % 3
-            padx = (0, 6) if button_col < 2 else (0, 0)
-            ttk.Button(actuator_box, text=label, command=command).grid(
-                row=button_row,
-                column=button_col,
-                sticky="ew",
-                padx=padx,
-                pady=(8 if index < 3 else 6, 0),
-            )
 
     def choose_calibration_file(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -5294,6 +5236,55 @@ class ScrabblePlotterApp:
                 commands.append(f"WORD_CELLS {index} " + ",".join(candidate.squares))
         return commands
 
+    def _player_1_challenge_candidates(self) -> list[ChallengeCandidate]:
+        board_candidates = self._build_challenge_candidates(limit=100)
+        candidates_by_word: dict[str, ChallengeCandidate] = {}
+        for candidate in board_candidates:
+            candidates_by_word.setdefault(candidate.word, candidate)
+
+        selected: list[ChallengeCandidate] = []
+        for value in getattr(self, "_player_1_words", [])[-3:]:
+            word = normalize_word(value)
+            if len(word) < 2:
+                continue
+            board_candidate = candidates_by_word.get(word)
+            if board_candidate is None:
+                selected.append(ChallengeCandidate(word, (), self._plain_word_score(word), 1))
+            else:
+                selected.append(
+                    ChallengeCandidate(
+                        board_candidate.word,
+                        board_candidate.squares,
+                        board_candidate.score,
+                        1,
+                    )
+                )
+        return selected
+
+    def _sync_player_1_challenge_words(self) -> None:
+        actuator_port_var = getattr(self, "actuator_port_var", None)
+        if actuator_port_var is None or not actuator_port_var.get().strip():
+            return
+
+        self._challenge_candidates = self._player_1_challenge_candidates()
+        self._challenge_candidate_index = 0
+        commands = ["WORD_CLEAR"]
+        for index, candidate in enumerate(self._challenge_candidates):
+            commands.append(f"WORD_ADD {candidate.word}")
+            if candidate.squares:
+                commands.append(f"WORD_CELLS {index} " + ",".join(candidate.squares))
+
+        if self._has_inline_actuator_test_double():
+            for command in commands:
+                self._send_actuator_command(command)
+            return
+
+        self._send_actuator_commands_async(
+            commands,
+            success_status=f"Player 1 challenge list updated: {len(self._challenge_candidates)} word(s).",
+            on_success=lambda _results: self._start_challenge_polling(),
+        )
+
     @staticmethod
     def _challenge_commands(candidates: list[ChallengeCandidate]) -> list[str]:
         commands = ScrabblePlotterApp._challenge_setup_commands(candidates)
@@ -5323,6 +5314,42 @@ class ScrabblePlotterApp:
             else None
         )
         self._send_actuator_commands_async([command], success_status=status)
+
+    def _send_timer_to_actuator(self, remaining_seconds: int) -> None:
+        remaining_seconds = max(0, int(remaining_seconds))
+        if getattr(self, "_last_actuator_timer_second", None) == remaining_seconds:
+            return
+        self._last_actuator_timer_second = remaining_seconds
+
+        actuator_port_var = getattr(self, "actuator_port_var", None)
+        if actuator_port_var is None or not actuator_port_var.get().strip():
+            return
+        command = f"TIMER {remaining_seconds}"
+        if self._has_inline_actuator_test_double():
+            self._send_actuator_command(command)
+            return
+
+        try:
+            config = self._actuator_config()
+        except Exception as exc:
+            self._log(f"Live timer display update skipped: {exc}")
+            return
+
+        def worker() -> None:
+            try:
+                with self._serial_lock:
+                    sender = self._get_actuator_sender_for_config(config)
+                    responses = sender.send_command(command)
+                    for response in responses:
+                        if response.lower().startswith("err"):
+                            raise RuntimeError(response)
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda exc=exc: self._log(f"Live timer display update failed: {exc}"),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _start_challenge_polling(self) -> None:
         if self._has_inline_actuator_test_double():
@@ -5370,6 +5397,7 @@ class ScrabblePlotterApp:
                 return
             self._stop_challenge_polling()
             self._handle_challenge_choice(*choice)
+            self._start_challenge_polling()
 
         def on_error(exc: Exception) -> None:
             self._log(f"Challenge button polling paused: {exc}")
@@ -5479,6 +5507,9 @@ class ScrabblePlotterApp:
         if not getattr(self, "_timer_running", False) or getattr(self, "_turn_scanning", False):
             return
         player_id = self._current_player_id()
+        if player_id != 2:
+            self._log("Timer button ignored because it is only enabled for Player 2.")
+            return
         self._log(f"Player {player_id} pressed the timer button; ending the turn.")
         self._end_turn()
 
@@ -5897,6 +5928,7 @@ class ScrabblePlotterApp:
         self._player_2_words.clear()
         self._player_1_score = 0
         self._player_2_score = 0
+        self._last_actuator_timer_second = None
         self._player_1_score_var.set(f"Player 1 (AI) Score: {self._player_1_score}")
         self._player_2_score_var.set(f"Player 2 Score: {self._player_2_score}")
         self._update_words_table()
@@ -5910,6 +5942,7 @@ class ScrabblePlotterApp:
         self._turn_scan_detected_words.clear()
         self._update_grid_colors()
         self._send_scores_to_actuator(announce=False)
+        self._sync_player_1_challenge_words()
         self._start_timer_button_polling()
         self._start_turn()
 
@@ -6434,6 +6467,7 @@ class ScrabblePlotterApp:
         minutes = remaining // 60
         seconds = remaining % 60
         self._timer_display_var.set(f"Time Remaining: {minutes}:{seconds:02d}")
+        self._send_timer_to_actuator(remaining)
         if remaining <= 0:
             self._end_turn()
         else:
@@ -6555,6 +6589,8 @@ class ScrabblePlotterApp:
             self._send_scores_to_actuator(announce=False)
         if added_words:
             self._update_words_table()
+            if player_id == 1:
+                self._sync_player_1_challenge_words()
 
     def _merge_unique_words(self, *word_lists: list[str]) -> list[str]:
         words: list[str] = []

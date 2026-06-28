@@ -1945,6 +1945,57 @@ class BoardActuatorGuiTests(unittest.TestCase):
             ],
         )
 
+    def test_player_one_challenge_list_excludes_player_two_words(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._player_1_words = ["CAT", "ZZQ"]
+        app._player_2_words = ["DOG"]
+        app._build_challenge_candidates = lambda limit=100: [
+            ChallengeCandidate("CAT", ("A1", "B1", "C1"), 5, 2),
+            ChallengeCandidate("DOG", ("D2", "D3", "D4"), 5, 2),
+        ]
+        app._plain_word_score = lambda word: len(word)
+
+        candidates = ScrabblePlotterApp._player_1_challenge_candidates(app)
+
+        self.assertEqual([candidate.word for candidate in candidates], ["CAT", "ZZQ"])
+        self.assertTrue(all(candidate.owner == 1 for candidate in candidates))
+        self.assertEqual(candidates[0].squares, ("A1", "B1", "C1"))
+        self.assertEqual(candidates[1].squares, ())
+
+    def test_player_one_challenge_list_keeps_only_latest_three_words(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._player_1_words = ["CAT", "DOG", "BIRD", "FISH", "LION"]
+        app._build_challenge_candidates = lambda limit=100: []
+        app._plain_word_score = lambda word: len(word)
+
+        candidates = ScrabblePlotterApp._player_1_challenge_candidates(app)
+
+        self.assertEqual([candidate.word for candidate in candidates], ["BIRD", "FISH", "LION"])
+
+    def test_player_one_words_sync_in_navigation_order(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("COM9")
+        app._challenge_candidate_index = 7
+        app.commands = []
+        app._player_1_challenge_candidates = lambda: [
+            ChallengeCandidate("CAT", ("A1", "B1", "C1"), 5, 1),
+            ChallengeCandidate("ZZQ", (), 29, 1),
+        ]
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+
+        ScrabblePlotterApp._sync_player_1_challenge_words(app)
+
+        self.assertEqual(
+            app.commands,
+            [
+                "WORD_CLEAR",
+                "WORD_ADD CAT",
+                "WORD_CELLS 0 A1,B1,C1",
+                "WORD_ADD ZZQ",
+            ],
+        )
+        self.assertEqual(app._challenge_candidate_index, 0)
+
     def test_challenge_button_choice_response_is_parsed(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
 
@@ -1983,6 +2034,23 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         self.assertEqual(app.ended_turns, 1)
         self.assertIn("Player 2 pressed the timer button", app.logs[-1])
+
+    def test_timer_button_is_ignored_for_player_one(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._game_started = True
+        app._timer_running = True
+        app._turn_scanning = False
+        app._current_player = 1
+        app._current_player_display_var = _FakeVar("Current Player: 1")
+        app.logs = []
+        app.ended_turns = 0
+        app._log = app.logs.append
+        app._end_turn = lambda: setattr(app, "ended_turns", app.ended_turns + 1)
+
+        ScrabblePlotterApp._handle_timer_button_press(app)
+
+        self.assertEqual(app.ended_turns, 0)
+        self.assertIn("only enabled for Player 2", app.logs[-1])
 
     def test_start_challenge_rejects_board_without_words(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
@@ -2166,6 +2234,19 @@ class BoardActuatorGuiTests(unittest.TestCase):
         self.assertEqual(app._player_2_score, 0)
         self.assertEqual(app.commands, ["SCORE P1 5 P2 0"])
         self.assertIn("valid", app.statuses[-1])
+
+    def test_live_timer_sends_each_remaining_second_once(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._last_actuator_timer_second = None
+        app.actuator_port_var = _FakeVar("COM9")
+        app.commands = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+
+        ScrabblePlotterApp._send_timer_to_actuator(app, 119)
+        ScrabblePlotterApp._send_timer_to_actuator(app, 119)
+        ScrabblePlotterApp._send_timer_to_actuator(app, 118)
+
+        self.assertEqual(app.commands, ["TIMER 119", "TIMER 118"])
 
     def test_challenge_choice_invalid_word_awards_challenger(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
