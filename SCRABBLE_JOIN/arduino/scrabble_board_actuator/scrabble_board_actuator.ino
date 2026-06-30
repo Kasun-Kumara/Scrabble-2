@@ -20,6 +20,8 @@ const unsigned long BUTTON_DEBOUNCE_MS = 35;
 const unsigned long SERVO_STEP_INTERVAL_MS = 20;
 const unsigned long ANIMATION_ROW_INTERVAL_MS = 120;
 const unsigned long ANIMATION_FINAL_HOLD_MS = 300;
+const unsigned long ENDING_ANIMATION_STEP_MS = 85;
+const unsigned long ENDING_ANIMATION_HOLD_MS = 300;
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 Servo actuatorServo;
@@ -101,6 +103,11 @@ int glowingRow = 0;
 int clearingRow = 0;
 bool clearingAnimation = false;
 bool animationActive = false;
+bool boardScanning = false;
+bool endingAnimationActive = false;
+byte endingAnimationStep = 0;
+bool endingAnimationContracting = false;
+unsigned long endingAnimationTime = 0;
 unsigned long lastAnimationTime = 0;
 
 int pixelIndex(int row, int column) {
@@ -117,6 +124,130 @@ int pixelIndex(int row, int column) {
 void clearLights() {
   strip.clear();
   strip.show();
+}
+
+bool cellMatches(int row, int column, const byte cells[][2], byte count) {
+  for (byte index = 0; index < count; index++) {
+    if (cells[index][0] == row && cells[index][1] == column) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void showPremiumLights() {
+  if (!systemOn || animationActive || endingAnimationActive || boardScanning || challengeLightsActive) {
+    return;
+  }
+
+  // Coordinates match the 12x12 premium layout used by the desktop app.
+  static const byte tripleWord[][2] = {
+    {0,0},{0,11},{11,0},{11,11},{0,5},{0,6},{5,0},{6,0},{11,5},{11,6},{5,11},{6,11}
+  };
+  static const byte doubleWord[][2] = {
+    {1,1},{2,2},{4,4},{1,10},{2,9},{4,7},{10,1},{9,2},{7,4},{10,10},{9,9},{7,7}
+  };
+  static const byte tripleLetter[][2] = {
+    {1,5},{1,6},{5,1},{6,1},{10,5},{10,6},{5,10},{6,10},{5,5},{6,6},{5,6},{6,5}
+  };
+  static const byte doubleLetter[][2] = {
+    {0,3},{0,8},{3,0},{8,0},{11,3},{11,8},{3,11},{8,11},
+    {2,6},{2,5},{3,3},{3,8},{8,3},{8,8},{6,2},{5,2},{6,9},{5,9}
+  };
+
+  strip.clear();
+  for (int row = 0; row < GRID_SIZE; row++) {
+    for (int column = 0; column < GRID_SIZE; column++) {
+      uint32_t color = 0;
+      if (cellMatches(row, column, doubleLetter, sizeof(doubleLetter) / sizeof(doubleLetter[0]))) {
+        color = strip.Color(0, 20, 255);       // DL: deep blue
+      } else if (cellMatches(row, column, tripleLetter, sizeof(tripleLetter) / sizeof(tripleLetter[0]))) {
+        color = strip.Color(255, 0, 0);        // TL: red
+      } else if (cellMatches(row, column, doubleWord, sizeof(doubleWord) / sizeof(doubleWord[0]))) {
+        color = strip.Color(150, 0, 255);      // DW: purple
+      } else if (cellMatches(row, column, tripleWord, sizeof(tripleWord) / sizeof(tripleWord[0]))) {
+        color = strip.Color(255, 150, 0);      // TW: gold
+      }
+      if (color != 0) {
+        // Board row labels run opposite to the animation's logical rows.
+        strip.setPixelColor(pixelIndex(GRID_SIZE - 1 - row, column), color);
+      }
+    }
+  }
+  strip.show();
+}
+
+void drawEndingDiamond(byte radiusStep) {
+  strip.clear();
+  for (int row = 0; row < GRID_SIZE; row++) {
+    for (int column = 0; column < GRID_SIZE; column++) {
+      // Doubled coordinates keep the diamond centered between the four middle cells.
+      int distanceFromCenter = abs(row * 2 - (GRID_SIZE - 1))
+        + abs(column * 2 - (GRID_SIZE - 1));
+      int edgeDistance = radiusStep * 2 + 2 - distanceFromCenter;
+      if (edgeDistance < 0) {
+        continue;
+      }
+      int brightness = max(70, 255 - edgeDistance * 10);
+      strip.setPixelColor(
+        pixelIndex(row, column),
+        // Exact same blue palette as the board-up glow.
+        strip.Color(38 * brightness / 255, 171 * brightness / 255, brightness)
+      );
+    }
+  }
+  strip.show();
+}
+
+void startEndingAnimation() {
+  animationActive = false;
+  clearingAnimation = false;
+  boardScanning = false;
+  challengeLightsActive = false;
+  endingAnimationActive = true;
+  endingAnimationStep = 0;
+  endingAnimationContracting = false;
+  endingAnimationTime = millis();
+  drawEndingDiamond(endingAnimationStep);
+}
+
+void updateEndingAnimation() {
+  if (!endingAnimationActive) {
+    return;
+  }
+
+  unsigned long now = millis();
+  unsigned long interval = endingAnimationContracting && endingAnimationStep == GRID_SIZE - 1
+    ? ENDING_ANIMATION_HOLD_MS
+    : ENDING_ANIMATION_STEP_MS;
+  if (now - endingAnimationTime < interval) {
+    return;
+  }
+  endingAnimationTime = now;
+
+  if (!endingAnimationContracting) {
+    if (endingAnimationStep < GRID_SIZE - 1) {
+      endingAnimationStep++;
+    } else {
+      endingAnimationContracting = true;
+    }
+    drawEndingDiamond(endingAnimationStep);
+    return;
+  }
+
+  if (endingAnimationStep > 0) {
+    endingAnimationStep--;
+    drawEndingDiamond(endingAnimationStep);
+  } else {
+    endingAnimationActive = false;
+    systemOn = false;
+    clearLights();
+    if (!actuatorServo.attached()) {
+      actuatorServo.attach(ACTUATOR_SERVO_PIN);
+    }
+    targetServoAngle = ACTUATOR_DOWN_ANGLE;
+    lastServoStepTime = 0;
+  }
 }
 
 void drawTopToBottomGlow(int activeRow) {
@@ -192,6 +323,7 @@ void updateBlueAnimation() {
     if (clearingRow >= GRID_SIZE) {
       animationActive = false;
       clearingAnimation = false;
+      showPremiumLights();
     }
   }
 }
@@ -220,6 +352,8 @@ void updateActuator() {
 
 void turnSystemOn() {
   systemOn = true;
+  endingAnimationActive = false;
+  boardScanning = false;
   if (!actuatorServo.attached()) {
     actuatorServo.attach(ACTUATOR_SERVO_PIN);
   }
@@ -229,15 +363,10 @@ void turnSystemOn() {
 }
 
 void turnSystemOff() {
-  systemOn = false;
-  animationActive = false;
-  challengeLightsActive = false;
-  if (!actuatorServo.attached()) {
-    actuatorServo.attach(ACTUATOR_SERVO_PIN);
+  if (!systemOn || endingAnimationActive) {
+    return;
   }
-  targetServoAngle = ACTUATOR_DOWN_ANGLE;
-  lastServoStepTime = 0;
-  clearLights();
+  startEndingAnimation();
 }
 
 void updateOnButton() {
@@ -544,6 +673,14 @@ void handleSerialCommand(char* command) {
   } else if (strcmp(command, "BOARD_DOWN") == 0) {
     turnSystemOff();
     Serial.println(F("ok board down"));
+  } else if (strcmp(command, "SCAN_START") == 0) {
+    boardScanning = true;
+    clearLights();
+    Serial.println(F("ok scan start"));
+  } else if (strcmp(command, "SCAN_END") == 0) {
+    boardScanning = false;
+    showPremiumLights();
+    Serial.println(F("ok scan end"));
   } else if (strcmp(command, "LED_TEST") == 0) {
     turnSystemOn();
     Serial.println(F("ok led test"));
@@ -606,5 +743,6 @@ void loop() {
   updateChallengeButtons();
   updateActuator();
   updateBlueAnimation();
+  updateEndingAnimation();
   updateScreen();
 }

@@ -4095,6 +4095,7 @@ class ScrabblePlotterApp:
         if getattr(self, "_pending_turn_scan", False):
             self._pending_turn_scan = False
             self._turn_scan_switch_after = False
+            self._set_board_scan_lights(False)
         if announce or self._last_live_word_scan_error != message:
             self._last_live_word_scan_error = message
             self._set_status(f"Word detection paused: {message}")
@@ -6512,8 +6513,21 @@ class ScrabblePlotterApp:
         self._turn_scan_switch_after = switch_after_scan
         self._turn_scan_detected_words = []
         self._turn_scan_started_state = dict(getattr(self, "_turn_start_board_state", self._previous_board_state))
+        self._set_board_scan_lights(True)
         self._log(f"Player {player_id} scan started.")
         return player_id
+
+    def _set_board_scan_lights(self, scanning: bool) -> None:
+        """Blank premium LEDs during OCR and restore them when OCR finishes."""
+        actuator_port_var = getattr(self, "actuator_port_var", None)
+        if actuator_port_var is None:
+            return
+        try:
+            if not actuator_port_var.get().strip():
+                return
+            self._send_actuator_command("SCAN_START" if scanning else "SCAN_END")
+        except Exception as exc:
+            self._log(f"Could not update board scan lights: {exc}")
 
     def _current_board_state(self) -> dict[str, str]:
         state: dict[str, str] = {}
@@ -6622,6 +6636,7 @@ class ScrabblePlotterApp:
 
     def _on_turn_scan_complete(self) -> None:
         self._log("Turn scan completed.")
+        self._set_board_scan_lights(False)
         scan_player = getattr(self, "_turn_scan_player", self._current_player_id())
         try:
             scan_player = int(scan_player)
