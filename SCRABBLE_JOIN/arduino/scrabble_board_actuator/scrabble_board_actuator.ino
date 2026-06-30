@@ -36,7 +36,7 @@ bool displayDirty = true;
 char serialLine[64];
 byte serialLength = 0;
 
-// Only Player 1's latest three words are available for challenge.
+// The latest three words from the previous player are available for challenge.
 const byte MAX_CHALLENGE_WORDS = 3;
 const byte MAX_WORD_LENGTH = 16;
 const byte CELL_BYTES = (LED_COUNT + 7) / 8;
@@ -465,6 +465,27 @@ void showSelectedWordInRed() {
   challengeLightsActive = true;
 }
 
+bool showCellsInRed(char* payload) {
+  bool foundCell = false;
+  strip.clear();
+  char* square = strtok(payload, ",");
+  while (square != NULL) {
+    if (square[0] >= 'A' && square[0] < 'A' + GRID_SIZE) {
+      int row = atoi(square + 1) - 1;
+      int column = square[0] - 'A';
+      if (row >= 0 && row < GRID_SIZE) {
+        int boardRow = GRID_SIZE - 1 - row;
+        strip.setPixelColor(pixelIndex(boardRow, column), strip.Color(255, 0, 0));
+        foundCell = true;
+      }
+    }
+    square = strtok(NULL, ",");
+  }
+  strip.show();
+  challengeLightsActive = foundCell;
+  return foundCell;
+}
+
 bool storeWordCells(char* payload) {
   char* cellsStart = NULL;
   long wordIndex = strtol(payload, &cellsStart, 10);
@@ -501,9 +522,11 @@ void updateChallengeButtons() {
 
   if (challengeMode && previousButton.pressed()) {
     selectPreviousWord();
+    showSelectedWordInRed();
   }
   if (challengeMode && nextButton.pressed()) {
     selectNextWord();
+    showSelectedWordInRed();
   }
   if (challengeButton.pressed()) {
     if (!challengeMode) {
@@ -511,6 +534,7 @@ void updateChallengeButtons() {
         selectedWordIndex = 0;
         challengeMode = true;
         challengeChoicePending = false;
+        showSelectedWordInRed();
         displayDirty = true;
       }
     } else {
@@ -543,7 +567,7 @@ void drawScreen() {
       if (challengeChoicePending) {
         screen.print(F("CHALLENGED"));
       } else {
-        screen.print(F("PLAYER 1 WORD "));
+        screen.print(F("CHALLENGE WORD "));
         screen.print(selectedWordIndex + 1);
         screen.print(F("/"));
         screen.print(challengeWordCount);
@@ -596,6 +620,7 @@ void handleSerialCommand(char* command) {
     if (challengeLightsActive) {
       clearLights();
       challengeLightsActive = false;
+      showPremiumLights();
     }
     displayDirty = true;
     Serial.println(F("ok score"));
@@ -644,16 +669,18 @@ void handleSerialCommand(char* command) {
       selectedWordIndex = 0;
       challengeMode = true;
       challengeChoicePending = false;
+      showSelectedWordInRed();
       displayDirty = true;
       Serial.println(F("ok challenge start"));
     } else {
-      Serial.println(F("err no player 1 words"));
+      Serial.println(F("err no challenge words"));
     }
   } else if (strcmp(command, "CHALLENGE_CANCEL") == 0) {
     challengeMode = false;
     challengeChoicePending = false;
     clearLights();
     challengeLightsActive = false;
+    showPremiumLights();
     displayDirty = true;
     Serial.println(F("ok challenge cancel"));
   } else if (strcmp(command, "CHALLENGE_TAKE") == 0) {
@@ -681,6 +708,12 @@ void handleSerialCommand(char* command) {
     boardScanning = false;
     showPremiumLights();
     Serial.println(F("ok scan end"));
+  } else if (strncmp(command, "LED_CELLS ", 10) == 0) {
+    if (showCellsInRed(command + 10)) {
+      Serial.println(F("ok led cells"));
+    } else {
+      Serial.println(F("err invalid led cells"));
+    }
   } else if (strcmp(command, "LED_TEST") == 0) {
     turnSystemOn();
     Serial.println(F("ok led test"));

@@ -34,6 +34,7 @@ from scrabble_plotter.openai_agent import (
     parse_detected_words,
 )
 from scrabble_plotter.gui import (
+    AI_CHALLENGE_LIGHT_MS,
     ChallengeCandidate,
     PICK_DROP_MAGNET_DELAY_MS,
     PICK_DROP_MOVE_DELAY_MS,
@@ -1972,6 +1973,21 @@ class BoardActuatorGuiTests(unittest.TestCase):
 
         self.assertEqual([candidate.word for candidate in candidates], ["BIRD", "FISH", "LION"])
 
+    def test_player_two_words_are_available_for_player_one_to_challenge(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._player_1_words = ["CAT"]
+        app._player_2_words = ["DOG", "ZZQ"]
+        app._build_challenge_candidates = lambda limit=100: [
+            ChallengeCandidate("DOG", ("D2", "D3", "D4"), 5, 1),
+        ]
+        app._plain_word_score = lambda word: len(word)
+
+        candidates = ScrabblePlotterApp._player_challenge_candidates(app, 2)
+
+        self.assertEqual([candidate.word for candidate in candidates], ["DOG", "ZZQ"])
+        self.assertTrue(all(candidate.owner == 2 for candidate in candidates))
+        self.assertEqual(candidates[0].squares, ("D2", "D3", "D4"))
+
     def test_player_one_words_sync_in_navigation_order(self) -> None:
         app = object.__new__(ScrabblePlotterApp)
         app.actuator_port_var = _FakeVar("COM9")
@@ -2271,6 +2287,71 @@ class BoardActuatorGuiTests(unittest.TestCase):
         self.assertEqual(app._player_2_score, 29)
         self.assertEqual(app.commands[-1], "SCORE P1 0 P2 29")
         self.assertIn("not valid", app.statuses[-1])
+
+    def test_player_one_wins_score_for_invalid_player_two_word(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._challenge_candidates = [ChallengeCandidate("ZZQ", ("D2", "D3", "D4"), 29, 2)]
+        app._current_player = 1
+        app._current_player_display_var = _FakeVar("Current Player: 1")
+        app._player_1_score = 0
+        app._player_2_score = 0
+        app._player_1_score_var = _FakeVar("")
+        app._player_2_score_var = _FakeVar("")
+        app.actuator_port_var = _FakeVar("COM9")
+        app.commands = []
+        app.logs = []
+        app.statuses = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._handle_challenge_choice(app, 0, "ZZQ")
+
+        self.assertEqual(app._player_1_score, 29)
+        self.assertEqual(app._player_2_score, 0)
+        self.assertEqual(app.commands[-1], "SCORE P1 29 P2 0")
+
+    def test_player_one_ai_automatically_challenges_invalid_player_two_word(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app.logs = []
+        app.statuses = []
+        app.scheduled = []
+        app.completed = []
+        app.handled = []
+        app.root = type(
+            "Root",
+            (),
+            {"after": lambda _self, delay, callback: app.scheduled.append((delay, callback))},
+        )()
+        app._build_challenge_candidates = lambda limit=100: [
+            ChallengeCandidate("ZZQ", ("D2", "D3", "D4"), 29, 2),
+        ]
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+        app._handle_challenge_choice = lambda index, word: app.handled.append((index, word))
+
+        started = ScrabblePlotterApp._start_ai_challenges(
+            app,
+            ["ZZQ"],
+            lambda: app.completed.append(True),
+        )
+
+        self.assertTrue(started)
+        self.assertEqual(
+            app.commands,
+            [
+                "WORD_CLEAR",
+                "WORD_LIST ZZQ",
+                "WORD_CELLS 0 D2,D3,D4",
+                "CHALLENGE_START",
+                "LED_CELLS D2,D3,D4",
+            ],
+        )
+        self.assertEqual(app.scheduled[0][0], AI_CHALLENGE_LIGHT_MS)
+        app.scheduled.pop(0)[1]()
+        self.assertEqual(app.handled, [(0, "ZZQ")])
 
 
     def test_letter_capture_does_not_clear_tile_rack_side_from_board_grid(self) -> None:

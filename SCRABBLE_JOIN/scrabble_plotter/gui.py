@@ -83,6 +83,7 @@ PICK_DROP_MAGNET_DELAY_MS = 1000
 PICK_DROP_MOVE_DELAY_MS = 1000
 PICK_DROP_Z_SETTLE_DELAY_MS = 1000
 CHALLENGE_POLL_INTERVAL_MS = 500
+AI_CHALLENGE_LIGHT_MS = 5000
 TIMER_BUTTON_POLL_INTERVAL_MS = 250
 TILE_CART_CALIBRATION_PWM = 35.0
 TILE_CART_SECONDS_PER_CM_AT_CALIBRATION_PWM = 0.130
@@ -4676,7 +4677,10 @@ class ScrabblePlotterApp:
         try:
             config = self._actuator_config()
         except Exception as exc:
-            self._show_error(exc)
+            if on_error is not None:
+                on_error(exc)
+            else:
+                self._show_error(exc)
             return
 
         def work():  # type: ignore[no-untyped-def]
@@ -5238,36 +5242,53 @@ class ScrabblePlotterApp:
         return commands
 
     def _player_1_challenge_candidates(self) -> list[ChallengeCandidate]:
+        return self._player_challenge_candidates(1)
+
+    def _player_challenge_candidates(self, player_id: int) -> list[ChallengeCandidate]:
         board_candidates = self._build_challenge_candidates(limit=100)
         candidates_by_word: dict[str, ChallengeCandidate] = {}
         for candidate in board_candidates:
             candidates_by_word.setdefault(candidate.word, candidate)
 
+        player_words = (
+            getattr(self, "_player_1_words", [])
+            if player_id == 1
+            else getattr(self, "_player_2_words", [])
+        )
         selected: list[ChallengeCandidate] = []
-        for value in getattr(self, "_player_1_words", [])[-3:]:
+        for value in player_words[-3:]:
             word = normalize_word(value)
             if len(word) < 2:
                 continue
             board_candidate = candidates_by_word.get(word)
             if board_candidate is None:
-                selected.append(ChallengeCandidate(word, (), self._plain_word_score(word), 1))
+                selected.append(ChallengeCandidate(word, (), self._plain_word_score(word), player_id))
             else:
                 selected.append(
                     ChallengeCandidate(
                         board_candidate.word,
                         board_candidate.squares,
                         board_candidate.score,
-                        1,
+                        player_id,
                     )
                 )
         return selected
 
     def _sync_player_1_challenge_words(self) -> None:
+        self._sync_player_challenge_words(1, self._player_1_challenge_candidates())
+
+    def _sync_player_challenge_words(
+        self,
+        player_id: int,
+        candidates: list[ChallengeCandidate] | None = None,
+    ) -> None:
         actuator_port_var = getattr(self, "actuator_port_var", None)
         if actuator_port_var is None or not actuator_port_var.get().strip():
             return
 
-        self._challenge_candidates = self._player_1_challenge_candidates()
+        self._challenge_candidates = (
+            candidates if candidates is not None else self._player_challenge_candidates(player_id)
+        )
         self._challenge_candidate_index = 0
         commands = ["WORD_CLEAR"]
         for index, candidate in enumerate(self._challenge_candidates):
@@ -5282,7 +5303,10 @@ class ScrabblePlotterApp:
 
         self._send_actuator_commands_async(
             commands,
-            success_status=f"Player 1 challenge list updated: {len(self._challenge_candidates)} word(s).",
+            success_status=(
+                f"Player {player_id} word list ready for Player {2 if player_id == 1 else 1} to challenge: "
+                f"{len(self._challenge_candidates)} word(s)."
+            ),
             on_success=lambda _results: self._start_challenge_polling(),
         )
 
@@ -6542,7 +6566,7 @@ class ScrabblePlotterApp:
         self,
         player_id: int | None = None,
         previous_state: dict[str, str] | None = None,
-    ) -> None:
+    ) -> list[str]:
         if player_id is None:
             player_id = self._current_player_id()
         else:
@@ -6589,7 +6613,7 @@ class ScrabblePlotterApp:
 
         turn_words = self._merge_unique_words(turn_words, getattr(self, "_turn_scan_detected_words", []))
         if not new_cells and not turn_words:
-            return
+            return []
 
         if player_id == 1:
             self._player_1_cells.update(new_cells)
@@ -6605,6 +6629,7 @@ class ScrabblePlotterApp:
             self._update_words_table()
             if player_id == 1:
                 self._sync_player_1_challenge_words()
+        return added_words
 
     def _merge_unique_words(self, *word_lists: list[str]) -> list[str]:
         words: list[str] = []
@@ -6634,6 +6659,60 @@ class ScrabblePlotterApp:
             added.append(word)
         return added
 
+    def _start_ai_challenges(self, player_2_words: list[str], on_complete) -> bool:  # type: ignore[no-untyped-def]
+        invalid_words = [word for word in player_2_words if not word_matches_reference(word)]
+        if not invalid_words:
+            return False
+
+        board_candidates = self._build_challenge_candidates(limit=100)
+        candidates_by_word = {candidate.word: candidate for candidate in board_candidates}
+        self._ai_challenge_queue = []
+        for word in invalid_words:
+            candidate = candidates_by_word.get(word)
+            if candidate is None:
+                candidate = ChallengeCandidate(word, (), self._plain_word_score(word), 2)
+            else:
+                candidate = ChallengeCandidate(candidate.word, candidate.squares, candidate.score, 2)
+            self._ai_challenge_queue.append(candidate)
+
+        self._run_next_ai_challenge(on_complete)
+        return True
+
+    def _run_next_ai_challenge(self, on_complete) -> None:  # type: ignore[no-untyped-def]
+        queue = getattr(self, "_ai_challenge_queue", [])
+        if not queue:
+            on_complete()
+            return
+
+        candidate = queue.pop(0)
+        self._challenge_candidates = [candidate]
+        self._challenge_candidate_index = 0
+        commands = self._challenge_commands([candidate])
+        self._log(f"Player 1 AI challenged Player 2's word {candidate.word}.")
+
+        def resolve() -> None:
+            self._handle_challenge_choice(0, candidate.word)
+            self.root.after(300, lambda: self._run_next_ai_challenge(on_complete))
+
+        def lights_ready(_results=None) -> None:  # type: ignore[no-untyped-def]
+            self._set_status(f"Player 1 AI challenges {candidate.word}.")
+            self.root.after(AI_CHALLENGE_LIGHT_MS, resolve)
+
+        if self._has_inline_actuator_test_double():
+            for command in commands:
+                self._send_actuator_command(command)
+            lights_ready()
+            return
+        self._send_actuator_commands_async(
+            commands,
+            success_status=f"Player 1 AI challenges {candidate.word}.",
+            on_success=lights_ready,
+            on_error=lambda exc: (
+                self._log(f"AI challenge lights failed: {exc}"),
+                resolve(),
+            ),
+        )
+
     def _on_turn_scan_complete(self) -> None:
         self._log("Turn scan completed.")
         self._set_board_scan_lights(False)
@@ -6645,13 +6724,24 @@ class ScrabblePlotterApp:
         if scan_player not in (1, 2):
             scan_player = self._current_player_id()
         scan_started_state = getattr(self, "_turn_scan_started_state", self._previous_board_state)
-        self._assign_new_words_to_current_player(scan_player, previous_state=scan_started_state)
+        added_words = self._assign_new_words_to_current_player(
+            scan_player,
+            previous_state=scan_started_state,
+        ) or []
 
         current_state = self._current_board_state()
 
         self._previous_board_state = current_state
         self._turn_scan_started_state = dict(current_state)
         self._update_grid_colors()
+        def finish_turn_transition() -> None:
+            self._finish_turn_scan_transition(scan_player, current_state)
+
+        if scan_player == 2 and self._start_ai_challenges(added_words, finish_turn_transition):
+            return
+        finish_turn_transition()
+
+    def _finish_turn_scan_transition(self, scan_player: int, current_state: dict[str, str]) -> None:
         if getattr(self, "_turn_scan_switch_after", False):
             if scan_player == 1:
                 self._current_player = 2
